@@ -1,0 +1,103 @@
+name: Build NInfer ActKV for RTX 2080 Ti
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-ninfer-actkv-2080ti.yml'
+      - 'backends/versions.json'
+      - 'backends/patches/ninfer-kvmem.patch'
+      - 'kvmem/**'
+      - 'scripts/prepare-backends.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ninfer-actkv-2080ti-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ninfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container: nvidia/cuda:13.2.0-devel-ubuntu24.04
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential cmake ninja-build \
+            python3 patchelf binutils file libssl-dev zstd
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare and verify the pinned NInfer/ActKV integration
+        run: |
+          python3 scripts/prepare-backends.py --backend ninfer
+          python3 scripts/prepare-backends.py --backend ninfer --check
+          git -C backends/ninfer rev-parse HEAD
+
+      - name: Configure NInfer for Turing sm_75
+        run: |
+          cmake -S backends/ninfer -B build/ninfer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNINFER_BUILD_APPS=ON \
+            -DNINFER_BUILD_BENCHMARKS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DNINFER_KVMEM_SOURCE_DIR="$GITHUB_WORKSPACE/kvmem" \
+            -DCMAKE_CUDA_ARCHITECTURES=75 \
+            -DCMAKE_C_FLAGS='-march=x86-64 -mtune=generic' \
+            -DCMAKE_CXX_FLAGS='-march=x86-64 -mtune=generic' \
+            -DCMAKE_CUDA_FLAGS='-Xcompiler=-march=x86-64 -Xcompiler=-mtune=generic'
+
+      - name: Build ninfer-serve
+        run: |
+          nproc
+          free -h
+          /usr/bin/time -v cmake --build build/ninfer --parallel 2 --target ninfer-serve
+
+      - name: Verify binary and DFlash/ActKV symbols
+        run: |
+          test -x build/ninfer/apps/serve/ninfer-serve
+          file build/ninfer/apps/serve/ninfer-serve
+          readelf -h build/ninfer/apps/serve/ninfer-serve
+          strings build/ninfer/apps/serve/ninfer-serve | grep -qi kvmem
+          strings build/ninfer/apps/serve/ninfer-serve | grep -Eqi 'dflash|actkv|kvmem-lrfu'
+
+      - name: Package executable and runtime libraries
+        run: |
+          rm -rf dist
+          mkdir -p dist/lib
+          cp build/ninfer/apps/serve/ninfer-serve dist/ninfer-kvmem-actkv-2080ti
+          patchelf --set-rpath '$ORIGIN:$ORIGIN/lib' dist/ninfer-kvmem-actkv-2080ti
+
+          ldd dist/ninfer-kvmem-actkv-2080ti \
+            | awk '/=> \/\// {print $3} /^\/[^ ]+ \(/ {print $1}' \
+            | sort -u \
+            | while read -r lib; do
+                [ -n "$lib" ] || continue
+                base=$(basename "$lib")
+                case "$base" in
+                  libc.so*|libm.so*|libpthread.so*|librt.so*|libdl.so*|libresolv.so*|libutil.so*|ld-linux*|libcuda.so*)
+                    continue ;;
+                esac
+                cp -L "$lib" "dist/lib/$base"
+              done
+
+          printf 'Packaged files:\n'
+          find dist -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+          tar -C dist -czf ninfer-kvmem-actkv-2080ti-sm75-cuda13.tar.gz .
+
+      - name: Upload RTX 2080 Ti artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-kvmem-actkv-2080ti-sm75-cuda13
+          path: |
+            dist/**
+            ninfer-kvmem-actkv-2080ti-sm75-cuda13.tar.gz
+          if-no-files-found: error
+          retention-days: 30
