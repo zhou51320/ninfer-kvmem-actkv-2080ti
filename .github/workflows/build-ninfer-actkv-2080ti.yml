@@ -21,7 +21,9 @@ concurrency:
 jobs:
   build-ninfer:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    # NInfer's CUDA sm_75 build can exceed three hours on the hosted runner.
+    # Keep enough headroom for the complete compile, verification and packaging.
+    timeout-minutes: 360
     container: nvidia/cuda:13.2.0-devel-ubuntu24.04
     steps:
       - name: Install build dependencies
@@ -65,7 +67,7 @@ jobs:
         run: |
           nproc
           free -h
-          /usr/bin/time -v cmake --build build/ninfer --parallel 2 --target ninfer-serve
+          /usr/bin/time -v cmake --build build/ninfer --parallel 4 --target ninfer-serve
 
       - name: Verify binary and DFlash/ActKV symbols
         run: |
