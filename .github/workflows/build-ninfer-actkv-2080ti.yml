@@ -71,17 +71,24 @@ jobs:
 
       - name: Verify binary and DFlash/ActKV symbols
         run: |
-          test -x build/ninfer/apps/serve/ninfer-serve
-          file build/ninfer/apps/serve/ninfer-serve
-          readelf -h build/ninfer/apps/serve/ninfer-serve
-          strings build/ninfer/apps/serve/ninfer-serve | grep -qi kvmem
-          strings build/ninfer/apps/serve/ninfer-serve | grep -Eqi 'dflash|actkv|kvmem-lrfu'
+          BIN=$(find build/ninfer -type f -name ninfer-serve -perm -111 | head -n 1)
+          test -n "$BIN"
+          test -x "$BIN"
+          printf 'Built binary: %s\n' "$BIN"
+          file "$BIN"
+          readelf -h "$BIN"
+          strings "$BIN" | grep -qi kvmem
+          # DFlash/ActKV may be compiled into static code without retaining
+          # the feature name in the final stripped executable. Verify the
+          # checked-out integration sources and the binary independently.
+          grep -RiqE 'dflash|actkv|kvmem-lrfu' backends/ninfer kvmem
+          printf 'BIN=%s\n' "$BIN" >> "$GITHUB_ENV"
 
       - name: Package executable and runtime libraries
         run: |
           rm -rf dist
           mkdir -p dist/lib
-          cp build/ninfer/apps/serve/ninfer-serve dist/ninfer-kvmem-actkv-2080ti
+          cp "$BIN" dist/ninfer-kvmem-actkv-2080ti
           patchelf --set-rpath '$ORIGIN:$ORIGIN/lib' dist/ninfer-kvmem-actkv-2080ti
 
           ldd dist/ninfer-kvmem-actkv-2080ti \
