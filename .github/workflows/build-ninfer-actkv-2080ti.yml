@@ -31,7 +31,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates git build-essential cmake ninja-build \
-            python3 patchelf binutils file libssl-dev pkg-config zstd
+            python3 patchelf binutils file libssl-dev pkg-config zstd \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
 
       - uses: actions/checkout@v4
 
