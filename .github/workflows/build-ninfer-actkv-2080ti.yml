@@ -37,6 +37,11 @@ jobs:
 
       - name: Prepare and verify the pinned NInfer/ActKV integration
         run: |
+          # The CUDA container runs as root while checkout files belong to the
+          # runner user; allow Git to inspect both the superproject and the
+          # submodule without triggering dubious-ownership protection.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/backends/ninfer"
           python3 scripts/prepare-backends.py --backend ninfer
           python3 scripts/prepare-backends.py --backend ninfer --check
           git -C backends/ninfer rev-parse HEAD
