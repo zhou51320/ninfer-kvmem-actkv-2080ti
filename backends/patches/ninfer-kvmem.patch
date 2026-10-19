@@ -8293,7 +8293,7 @@ index 00000000..65bf1370
 +
 +} // namespace ninfer::ops::pre_sm80
 diff --git a/src/ops/common/rowsplit_a8_mma.cuh b/src/ops/common/rowsplit_a8_mma.cuh
-index d88dd483..1d5e1e9d 100644
+index d88dd483..1d405f52 100644
 --- a/src/ops/common/rowsplit_a8_mma.cuh
 +++ b/src/ops/common/rowsplit_a8_mma.cuh
 @@ -38,6 +38,8 @@
@@ -8322,15 +8322,29 @@ index d88dd483..1d5e1e9d 100644
  constexpr int kRingBufs   = 2;
  
  __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
-@@ -86,6 +94,7 @@ __device__ __forceinline__ unsigned lds8(const void* p) {
+@@ -86,8 +94,13 @@ __device__ __forceinline__ unsigned lds8(const void* p) {
      return r;
  }
  
 +// 16-byte copies bypass L1 (.cg); narrower ones may only use .ca.
  template <int kBytes>
  __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
++#if defined(NINFER_SM75)
++    ninfer::ops::cp_async<kBytes, kBytes == 16 ? ninfer::ops::Cache::cg : ninfer::ops::Cache::ca>(
++        smem, gmem);
++#else
      const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-@@ -283,6 +292,8 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
+     if constexpr (kBytes == 16) {
+         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(addr), "l"(gmem));
+@@ -95,6 +108,7 @@ __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
+         asm volatile("cp.async.ca.shared.global [%0], [%1], %2;" ::"r"(addr), "l"(gmem),
+                      "n"(kBytes));
+     }
++#endif
+ }
+ 
+ // Two packed bytes hold four consecutive k as (low,high) nibble pairs; this spreads them to one
+@@ -283,6 +297,8 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
      constexpr int kXsBytes = BN * 2;
      constexpr int kStage   = kWBytes + kHBytes + kXBytes + kXsBytes;
      constexpr int kRingBytes = BM * kRingGroups * 2;
@@ -8339,7 +8353,16 @@ index d88dd483..1d5e1e9d 100644
  
      extern __shared__ char smem[];
      char* const s_base = smem;
-@@ -413,9 +424,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
+@@ -391,7 +407,7 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
+                                                   sizeof(__half));
+             }
+         }
+-        asm volatile("cp.async.commit_group;");
++        ninfer::ops::cp_commit();
+     };
+ 
+     float acc[MT][NT][4];
+@@ -413,9 +429,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
          const int issued  = (g + kStages < kGroups) ? (g + kStages) : kGroups;
          const int allowed = issued - (g + 1);
          if (allowed >= 1) {
@@ -8351,7 +8374,7 @@ index d88dd483..1d5e1e9d 100644
          }
          __syncthreads();
  
-@@ -556,6 +567,39 @@ template <class Codec, int MT, int NT, class RowMap>
+@@ -556,6 +572,39 @@ template <class Codec, int MT, int NT, class RowMap>
      return 0;
  }
  
