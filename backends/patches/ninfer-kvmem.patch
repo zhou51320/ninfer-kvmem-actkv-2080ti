@@ -315,6 +315,27 @@ index cd72229d..4560e990 100644
              definitions.push_back(
                  ninfer::serve::ModelDefinition{.id = ninfer::serve::resolve_public_model_id(
                                                     options, first->load_summary().model_name),
+diff --git a/bench/ops/sampling_select_bench.cu b/bench/ops/sampling_select_bench.cu
+index b94f77ce..f210f715 100644
+--- a/bench/ops/sampling_select_bench.cu
++++ b/bench/ops/sampling_select_bench.cu
+@@ -297,14 +297,14 @@ void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool
+     Tensor tnum(num.p, DType::I32, {1});
+     Tensor taccepted(accepted.p, DType::I32, {1});
+     WorkspaceArena workspace(
+-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(kTokenDomain, k, k, 1, 1));
++        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(kTokenDomain, k, k, 1, 1));
+     const auto* config_ptr = static_cast<const ops::SamplingConfig*>(config.p);
+ 
+     const double bytes  = mode == Mode::Greedy ? static_cast<double>((k + 1) * 4 + k * 4)
+                                                : stochastic_payload_bytes(k + 1, counts_active);
+     const Result result = bench_loop(
+         [&](cudaStream_t stream) {
+-            ops::speculative_accept_greedy_drafts(ttargets, tlogits, tdrafts, textent, tlength,
++            ops::speculative_accept_coupled_drafts(ttargets, tlogits, tdrafts, textent, tlength,
+                                                   ttoken, tsampled, tnum, taccepted, kTokenDomain,
+                                                   config_ptr, workspace, stream);
+         },
 diff --git a/docs/cli.md b/docs/cli.md
 index ff62f7a4..2f424c71 100644
 --- a/docs/cli.md
@@ -939,6 +960,85 @@ index b27d2a68..8b1b4240 100644
  ### A mixed-precision Qwen3.8-27B GGUF
  
  `qwen3_8_27b_gguf` ([`gguf_blocks.py`](../tools/convert/gguf_blocks.py)) imports a Qwen3.8-27B GGUF
+diff --git a/include/ninfer/ops/speculative_round.h b/include/ninfer/ops/speculative_round.h
+index 2166e48e..710a2920 100644
+--- a/include/ninfer/ops/speculative_round.h
++++ b/include/ninfer/ops/speculative_round.h
+@@ -20,7 +20,7 @@ struct SpeculativeAcceptExecutionEnvelope {
+ 
+ // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
+ // domains. token_domain is the fixed sampling profile; invalid domains throw.
+-[[nodiscard]] std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(
++[[nodiscard]] std::size_t speculative_accept_coupled_drafts_workspace_capacity_bytes(
+     std::int32_t token_domain, std::int32_t min_drafts, std::int32_t max_drafts,
+     std::int32_t min_batch, std::int32_t max_batch);
+ 
+@@ -88,18 +88,21 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
+                                         cudaStream_t stream);
+ 
+ /**
+- * Op: speculative_accept_greedy_drafts
++ * Op: speculative_accept_coupled_drafts
+  *
+  * Algorithm:
+  *   Independently for each row b, greedy mode accepts the longest available draft prefix matching
+  *   the per-column penalty-adjusted argmax and commits that argmax at the first mismatch (or the
+  *   bonus column). With both penalties disabled and no token mask, target_tokens is the exact
+- * raw-logit fast path. Sampling mode applies configs[b] to each valid verification column, accepts
+- * draft i with target probability p_i(draft_i), samples from the residual distribution on first
+- * rejection, and samples a bonus from column Pcur[b] when every available draft is accepted. The
+- * draft proposal distribution is one-hot at each greedy draft token. RNG domains are the
+- * speculative accept/correction/bonus SamplePurpose values and logical positions derived from the
+- * old length.
++ *   raw-logit fast path. Sampling mode (coupled verification) applies configs[b] to each valid
++ *   verification column i and draws t_i from it exactly as sample() would, with key
++ *   (configs[b].seed, lengths[b]+i+1, kSamplePurposeDecode): the decode key of the position the
++ *   column fills. It keeps drafts while drafts[i]==t_i and commits t_i at the first difference,
++ *   or the bonus column's draw when every available draft matched. Every committed token is thus
++ *   the target's own keyed draw whatever was drafted: drafts change how many tokens one pass
++ *   commits, never which. A greedy draft is kept with probability p_i(draft), as under one-hot
++ *   rejection sampling; a draft drawn from another distribution with the same key is kept as
++ *   often as the two inverse-CDF draws agree.
+  *
+  * Logical shapes:
+  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B], drafts is
+@@ -109,10 +112,10 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
+  *   configs[b].token_counts do not overlap except for the explicitly mutated objects.
+  *
+  * Numeric:
+- *   Sampling filtering, penalties, normalization, and RNG semantics are those of sampling.h.
+- *   Token mask column i is conditioned on drafts[0..i), including the bonus column. It is
+- *   applied before truncation/normalization; the proposal q is unchanged. Rejection therefore
+- *   samples max(p_constrained-q,0), preserving the constrained target distribution.
++ *   Sampling filtering, penalties, normalization, the inverse-CDF draw and RNG semantics are
++ *   those of sampling.h. Column i's penalty overlay is drafts[0..i), and token mask column i is
++ *   conditioned on drafts[0..i), including the bonus column; both apply before
++ *   truncation/normalization, so each draw is from the constrained target distribution.
+  *
+  * Effects:
+  *   For each row, let A be the accepted draft count and L=A+1. licensed_tokens[0:A,b] receives
+@@ -125,14 +128,14 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
+  *
+  * Workspace:
+  *   Caller-owned transient storage reported by
+- *   speculative_accept_greedy_drafts_workspace_capacity_bytes().
++ *   speculative_accept_coupled_drafts_workspace_capacity_bytes().
+  */
+-void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
+-                                      const Tensor& drafts, const Tensor& current_extents,
+-                                      Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+-                                      Tensor& licensed_counts, Tensor& accepted,
+-                                      std::int32_t token_domain, const SamplingConfig* configs,
+-                                      WorkspaceArena& workspace, cudaStream_t stream);
++void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor& logits,
++                                       const Tensor& drafts, const Tensor& current_extents,
++                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
++                                       Tensor& licensed_counts, Tensor& accepted,
++                                       std::int32_t token_domain, const SamplingConfig* configs,
++                                       WorkspaceArena& workspace, cudaStream_t stream);
+ 
+ // Caller-owned transient capacity over the inclusive draft-count and batch intervals.
+ // The raw-greedy execution envelope requires no workspace.
 diff --git a/include/ninfer/ops/token_sums.h b/include/ninfer/ops/token_sums.h
 new file mode 100644
 index 00000000..c958ba04
@@ -3930,7 +4030,7 @@ index 0014a8c6..bdeda673 100644
  
  struct OrdinaryBatchContext {
 diff --git a/src/models/qwen3_5/program/decode.cpp b/src/models/qwen3_5/program/decode.cpp
-index 0b02d06b..269fe6a9 100644
+index 0b02d06b..f2232037 100644
 --- a/src/models/qwen3_5/program/decode.cpp
 +++ b/src/models/qwen3_5/program/decode.cpp
 @@ -42,6 +42,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
@@ -3946,7 +4046,7 @@ index 0b02d06b..269fe6a9 100644
          ops::sample(logits, sampled,
                      dimension(state.execution.parameters.model.resources().public_token_count),
 -                    ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
-+                    ordinary.sampling, ordinary.logical_frontiers.slice(0, 0, batch_size), ops::kSamplePurposeDecode,
++                    ordinary.sampling, ordinary.sample_positions.slice(0, 0, batch_size), ops::kSamplePurposeDecode,
                      state.execution.work, state.execution.device.stream);
          CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                     sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
@@ -3971,17 +4071,19 @@ index 0b02d06b..269fe6a9 100644
      }
  
      const auto start = Clock::now();
-@@ -498,7 +502,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+@@ -498,7 +502,10 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
              const std::uint32_t frontier       = sequence.execution_frontier;
              ordinary_host_ingress->tokens[row] = sequence.ledger.back();
              ordinary_host_ingress->cache_positions[row] =
 -                checked_i32(frontier, "ordinary batch position");
 +                checked_i32(compact_position(sequence, frontier), "ordinary batch position");
 +            ordinary_host_ingress->logical_frontiers[row] = checked_i32(frontier, "ordinary RNG frontier");
++            ordinary_host_ingress->sample_positions[row] =
++                checked_i32(frontier + 1U, "ordinary batch sample position");
              ordinary_host_ingress->rope_positions[row] =
                  checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
              ordinary_host_ingress->text_kv_table_rows[row] =
-@@ -526,6 +531,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+@@ -526,6 +533,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
              *ordinary_host_egress,
              state_images->continuation_hidden_store()};
  
@@ -3989,7 +4091,7 @@ index 0b02d06b..269fe6a9 100644
          mark_workspace_usage(workspace_plan.ordinary_round);
          execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                           envelope, executable);
-@@ -539,6 +545,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+@@ -539,6 +547,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
          }
          timing.end_wait();
  
@@ -3997,7 +4099,7 @@ index 0b02d06b..269fe6a9 100644
          const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
          for (std::size_t row = 0; row < lanes.size(); ++row) {
              SequenceState& sequence    = active_sequence(lanes[row]);
-@@ -552,6 +559,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+@@ -552,6 +561,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
              if (request.logprobs) {
                  round_logprobs[row] = fetched_logprob(static_cast<std::int32_t>(row), token);
              }
@@ -4005,7 +4107,7 @@ index 0b02d06b..269fe6a9 100644
              sequence.text_kv_valid = base_E + 1;
              commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
              sequence.tail_hidden_valid = true;
-@@ -615,7 +623,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+@@ -615,7 +625,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                  lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
              throw std::invalid_argument("MTP batch contains an invalid or duplicate lane");
          }
@@ -4014,7 +4116,7 @@ index 0b02d06b..269fe6a9 100644
          const RequestControl& request = requests[lane];
          if (request.lifecycle != Lifecycle::Active ||
              budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
-@@ -630,7 +638,12 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+@@ -630,7 +640,12 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
              sequence.mtp_draft_count > draft_window) {
              throw std::logic_error("MTP batch row is not decode-ready");
          }
@@ -4028,7 +4130,7 @@ index 0b02d06b..269fe6a9 100644
          signals[row]     = &request.mtp_signal;
          room[row]        = std::min(budgets[row].generated_tokens_remaining,
                                      capacity - sequence.execution_frontier);
-@@ -656,6 +669,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+@@ -656,6 +671,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                         mtp_minimum_adaptive_window(draft_window), draft_window);
      }
      const std::uint32_t width = verify_window + 1;
@@ -4036,7 +4138,7 @@ index 0b02d06b..269fe6a9 100644
  
      const auto started = Clock::now();
      try {
-@@ -664,7 +678,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+@@ -664,7 +680,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                               static_cast<std::uint64_t>(lanes.size()));
          DecodeGraphExecutable* executable = nullptr;
          execution::MtpCausalAttentionEnvelopes envelopes =
@@ -4045,7 +4147,7 @@ index 0b02d06b..269fe6a9 100644
          if (use_cuda_graph) {
              DecodeGraphFamily& family = copy_round ? ngram_graphs : mtp_graphs;
              DecodeGraphProfile& profile =
-@@ -672,7 +686,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+@@ -672,7 +688,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                       maximum_frontier, "MTP batch", verify_window);
              executable = &install_graph_profile(family, profile, "MTP batch");
              envelopes  = mtp_causal_attention_envelopes(profile.max_execution_frontier,
@@ -4054,7 +4156,7 @@ index 0b02d06b..269fe6a9 100644
          }
  
          bool logprobs = false;
-@@ -690,7 +704,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+@@ -690,7 +706,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                            : sequence.mtp_draft_count,
                   verify_window, max_by_budget, capacity - sequence.execution_frontier - 1});
              mtp_host_ingress->anchors[row]        = sequence.ledger.back();
@@ -4064,7 +4166,7 @@ index 0b02d06b..269fe6a9 100644
              mtp_host_ingress->remaining_budgets[row] =
                  checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
              mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
-@@ -712,7 +727,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+@@ -712,7 +729,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
              const StateImageSelectors selectors            = state_selectors(sequence);
              mtp_host_ingress->state_source_slots[row]      = selectors.source;
              mtp_host_ingress->state_destination_slots[row] = selectors.destination;
@@ -4073,7 +4175,7 @@ index 0b02d06b..269fe6a9 100644
              mtp_host_ingress->sampling[row]                = request.sampling_host;
              logprobs = logprobs || request.logprobs;
              if (request.grammar) {
-@@ -739,6 +754,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+@@ -739,6 +756,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
              *mtp_host_egress,
              state_images->continuation_hidden_store()};
  
@@ -4081,7 +4183,7 @@ index 0b02d06b..269fe6a9 100644
          mark_workspace_usage(workspace_plan.mtp_round);
          execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                      verify_window, draft_window, envelopes, executable);
-@@ -1177,6 +1193,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
+@@ -1177,6 +1195,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
      }
      trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
      if (terminal) { sequence.mtp_draft_count = 0; }
@@ -4090,7 +4192,7 @@ index 0b02d06b..269fe6a9 100644
      request.pending   = {};
      return timing.finish();
 diff --git a/src/models/qwen3_5/program/graphs.cpp b/src/models/qwen3_5/program/graphs.cpp
-index c1cd1f60..35e6e1a6 100644
+index c1cd1f60..3525891c 100644
 --- a/src/models/qwen3_5/program/graphs.cpp
 +++ b/src/models/qwen3_5/program/graphs.cpp
 @@ -275,6 +275,7 @@ void ProgramImpl::prepare_graphs() {
@@ -4101,16 +4203,18 @@ index c1cd1f60..35e6e1a6 100644
                  mtp_host_ingress->remaining_budgets[row] =
                      checked_i32(capacity, "graph representative MTP budget");
                  mtp_host_ingress->current_extents[row] = static_cast<std::int32_t>(extent);
-@@ -303,6 +304,8 @@ void ProgramImpl::prepare_graphs() {
+@@ -303,6 +304,10 @@ void ProgramImpl::prepare_graphs() {
                  ordinary_host_ingress->tokens[row] = 0;
                  ordinary_host_ingress->cache_positions[row] =
                      checked_i32(frontier, "graph representative ordinary position");
 +                ordinary_host_ingress->logical_frontiers[row] =
 +                    checked_i32(frontier, "graph representative ordinary RNG frontier");
++                ordinary_host_ingress->sample_positions[row] =
++                    checked_i32(frontier + 1U, "graph representative ordinary sample position");
                  ordinary_host_ingress->rope_positions[row] =
                      checked_i32(frontier, "graph representative ordinary RoPE position");
                  ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
-@@ -325,7 +328,8 @@ void ProgramImpl::prepare_graphs() {
+@@ -325,7 +330,8 @@ void ProgramImpl::prepare_graphs() {
                                          stage_runtime.get(),
                                          rope_yarn,
                                          fast_prefill_kernel,
@@ -4120,7 +4224,7 @@ index c1cd1f60..35e6e1a6 100644
      };
  
      const auto& text_attention = *parameters.model.config().text.attention;
-@@ -336,8 +340,8 @@ void ProgramImpl::prepare_graphs() {
+@@ -336,8 +342,8 @@ void ProgramImpl::prepare_graphs() {
  
      if (speculative_backend == SpeculativeBackend::None) {
          const auto ordinary_profiles =
@@ -4131,7 +4235,7 @@ index c1cd1f60..35e6e1a6 100644
          const std::uint32_t ordinary_batch_limit = max_concurrency;
          execution::OrdinaryBatchContext ordinary_state{
              execution_core(),      decoder->text_kv,
-@@ -379,9 +383,9 @@ void ProgramImpl::prepare_graphs() {
+@@ -379,9 +385,9 @@ void ProgramImpl::prepare_graphs() {
          constexpr std::uint32_t kMtpClassesPerWidth = 64;
          for (std::uint32_t verify_window = first_window; verify_window <= draft_window;
               ++verify_window) {
@@ -4143,7 +4247,7 @@ index c1cd1f60..35e6e1a6 100644
              for (const GraphExecutionProfile& planned : planned_profiles) {
                  if (planned.topology_class >= kMtpClassesPerWidth) {
                      throw std::logic_error("MTP graph profiles exceed the classes of one width");
-@@ -396,17 +400,19 @@ void ProgramImpl::prepare_graphs() {
+@@ -396,17 +402,19 @@ void ProgramImpl::prepare_graphs() {
                                                   *mtp_host_egress,
                                                   state_images->continuation_hidden_store()};
              const GraphExecutionProfile code_warm = planned_profiles.front();
@@ -4171,7 +4275,7 @@ index c1cd1f60..35e6e1a6 100644
                  for (const GraphExecutionProfile planned : planned_profiles) {
                      mtp_graphs.profiles.emplace_back();
                      DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
-@@ -422,7 +428,7 @@ void ProgramImpl::prepare_graphs() {
+@@ -422,7 +430,7 @@ void ProgramImpl::prepare_graphs() {
                          mtp_state, static_cast<std::int32_t>(batch_size), verify_window,
                          draft_window,
                          mtp_causal_attention_envelopes(planned.max, verify_window, draft_window,
@@ -4180,7 +4284,7 @@ index c1cd1f60..35e6e1a6 100644
                          profile.definition);
                  }
              }
-@@ -432,9 +438,10 @@ void ProgramImpl::prepare_graphs() {
+@@ -432,9 +440,10 @@ void ProgramImpl::prepare_graphs() {
              // frame viewed at that width. Above 15 drafts only one request may be active.
              const std::uint32_t verify_window = ngram_draft_window;
              const std::uint32_t batch_limit   = verify_window > 15U ? 1U : max_concurrency;
@@ -4193,7 +4297,7 @@ index c1cd1f60..35e6e1a6 100644
              qwen3_5::MtpDecodeState frame = io.mtp_decode->verification_view(verify_window);
              execution::MtpBatchContext mtp_state{execution_core(),
                                                   decoder->text_kv,
-@@ -444,16 +451,16 @@ void ProgramImpl::prepare_graphs() {
+@@ -444,16 +453,16 @@ void ProgramImpl::prepare_graphs() {
                                                   *mtp_host_egress,
                                                   state_images->continuation_hidden_store()};
              const GraphExecutionProfile code_warm = planned_profiles.front();
@@ -4218,7 +4322,7 @@ index c1cd1f60..35e6e1a6 100644
                  for (const GraphExecutionProfile planned : planned_profiles) {
                      ngram_graphs.profiles.emplace_back();
                      DecodeGraphProfile& profile    = ngram_graphs.profiles.back();
-@@ -467,7 +474,7 @@ void ProgramImpl::prepare_graphs() {
+@@ -467,7 +476,7 @@ void ProgramImpl::prepare_graphs() {
                          mtp_state, static_cast<std::int32_t>(batch_size), verify_window,
                          draft_window,
                          mtp_causal_attention_envelopes(planned.max, verify_window, draft_window,
@@ -4387,7 +4491,7 @@ index 9811b10e..33ff7102 100644
      std::uint64_t vision_patches = 0;
      if (plan.vision) {
 diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
-index 24133567..85ee7b43 100644
+index 24133567..8a23c9a9 100644
 --- a/src/models/qwen3_5/program/planning/startup.cpp
 +++ b/src/models/qwen3_5/program/planning/startup.cpp
 @@ -133,7 +133,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
@@ -4475,6 +4579,33 @@ index 24133567..85ee7b43 100644
                                              plan.features.vision ? tokens : 0,
                                              plan.features.host_staged_vision());
      };
+@@ -643,7 +676,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
+         mtp_full_call(mtp_align, 1, text_envelope, false);
+         WorkspaceLayoutBuilder mtp_proposal;
+         proposal_scratch(mtp_proposal, 1);
+-        const std::size_t accept = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
++        const std::size_t accept = ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
+             dimension(parameters.model.resources().public_token_count), narrowest_drafts,
+             verify_drafts, 1, 1);
+         out.mtp_round = std::max({accept, finish(mtp_batch), finish(mtp_ar), finish(mtp_proposal)});
+@@ -689,7 +722,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
+             WorkspaceLayoutBuilder proposal;
+             proposal_scratch(proposal, batch);
+             const std::size_t batch_accept =
+-                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
++                ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
+                     dimension(parameters.model.resources().public_token_count), narrowest_drafts,
+                     verify_drafts, batch, batch);
+             const std::size_t gather = ops::logprob_topk_workspace_capacity_bytes(
+@@ -870,7 +903,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
+                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                               dimension(parameters.model.resources().public_token_count), {false},
+                               narrowest_drafts, verify_drafts, batch, batch)
+-                        : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
++                        : ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
+                               dimension(parameters.model.resources().public_token_count),
+                               narrowest_drafts, verify_drafts, batch, batch);
+                 // A copy round above batch one also runs the drafter at its own window, and a
 @@ -979,19 +1012,26 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                                      " pipeline stages but " + std::to_string(device.size()) +
                                      " devices are attached");
@@ -5648,7 +5779,7 @@ index b82aeb3f..5887033c 100644
                                     std::uint32_t backend_tokens = 0);
  
 diff --git a/src/models/qwen3_5/program/round_buffers.cpp b/src/models/qwen3_5/program/round_buffers.cpp
-index df8be40d..c9edc61d 100644
+index df8be40d..ef87acc8 100644
 --- a/src/models/qwen3_5/program/round_buffers.cpp
 +++ b/src/models/qwen3_5/program/round_buffers.cpp
 @@ -124,6 +124,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
@@ -5659,7 +5790,16 @@ index df8be40d..c9edc61d 100644
      rope_positions  = ingress_tensor(offsetof(OrdinaryDecodeIngress, rope_positions), DType::I32);
      text_kv_table_rows =
          ingress_tensor(offsetof(OrdinaryDecodeIngress, text_kv_table_rows), DType::I32);
-@@ -289,6 +290,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
+@@ -131,6 +132,8 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
+         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_source_slots), DType::I32);
+     state_destination_slots =
+         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_destination_slots), DType::I32);
++    sample_positions =
++        ingress_tensor(offsetof(OrdinaryDecodeIngress, sample_positions), DType::I32);
+     sampling = reinterpret_cast<const ops::SamplingConfig*>(
+         static_cast<const unsigned char*>(ingress.data) +
+         offsetof(OrdinaryDecodeIngress, sampling));
+@@ -289,6 +292,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
      anchors = ingress_tensor(offsetof(MtpDecodeIngress, anchors), DType::I32, {batch});
      base_frontiers =
          ingress_tensor(offsetof(MtpDecodeIngress, base_frontiers), DType::I32, {batch});
@@ -5669,10 +5809,10 @@ index df8be40d..c9edc61d 100644
          ingress_tensor(offsetof(MtpDecodeIngress, remaining_budgets), DType::I32, {batch});
      current_extents =
 diff --git a/src/models/qwen3_5/program/round_buffers.h b/src/models/qwen3_5/program/round_buffers.h
-index e0cbd446..f5db2ffc 100644
+index e0cbd446..c0896a80 100644
 --- a/src/models/qwen3_5/program/round_buffers.h
 +++ b/src/models/qwen3_5/program/round_buffers.h
-@@ -40,6 +40,7 @@ struct RoundStateSpec {
+@@ -40,10 +40,14 @@ struct RoundStateSpec {
  struct OrdinaryDecodeIngress {
      std::array<TokenId, kMaximumConcurrency> tokens{};
      std::array<std::int32_t, kMaximumConcurrency> cache_positions{};
@@ -5680,7 +5820,14 @@ index e0cbd446..f5db2ffc 100644
      std::array<std::int32_t, kMaximumConcurrency> rope_positions{};
      std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
      std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-@@ -56,6 +57,7 @@ struct OrdinaryDecodeEgress {
+     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
++    // The position each sampled token fills (cache position + 1), its decode sampling key: the key
++    // speculative verification draws that position with too (speculative_accept_coupled_drafts).
++    std::array<std::int32_t, kMaximumConcurrency> sample_positions{};
+     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+ };
+ 
+@@ -56,6 +60,7 @@ struct OrdinaryDecodeEgress {
  struct MtpDecodeIngress {
      std::array<TokenId, kMaximumConcurrency> anchors{};
      std::array<std::int32_t, kMaximumConcurrency> base_frontiers{};
@@ -5688,7 +5835,7 @@ index e0cbd446..f5db2ffc 100644
      std::array<std::int32_t, kMaximumConcurrency> remaining_budgets{};
      std::array<std::int32_t, kMaximumConcurrency> current_extents{};
      std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-@@ -202,6 +204,7 @@ struct OrdinaryDecodeState {
+@@ -202,10 +207,12 @@ struct OrdinaryDecodeState {
      DeviceSpan egress;
      Tensor tokens;
      Tensor cache_positions;
@@ -5696,7 +5843,12 @@ index e0cbd446..f5db2ffc 100644
      Tensor rope_positions;
      Tensor text_kv_table_rows;
      Tensor state_source_slots;
-@@ -246,6 +249,7 @@ struct MtpDecodeState {
+     Tensor state_destination_slots;
++    Tensor sample_positions;
+     const ops::SamplingConfig* sampling = nullptr;
+     Tensor sampled_tokens;
+     Tensor logits;
+@@ -246,6 +253,7 @@ struct MtpDecodeState {
      DeviceSpan egress;
      Tensor anchors;
      Tensor base_frontiers;
@@ -5726,7 +5878,7 @@ index 7e2d63cf..8828469b 100644
                                       .licensed_tokens         = licensed_tokens,
                                       .licensed_counts         = licensed_counts,
 diff --git a/src/models/qwen3_5/program/speculative/target_verification.cpp b/src/models/qwen3_5/program/speculative/target_verification.cpp
-index 6624ef8f..db9046a5 100644
+index 6624ef8f..e711c1e0 100644
 --- a/src/models/qwen3_5/program/speculative/target_verification.cpp
 +++ b/src/models/qwen3_5/program/speculative/target_verification.cpp
 @@ -12,6 +12,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
@@ -5737,6 +5889,15 @@ index 6624ef8f..db9046a5 100644
      if (frame.feature_sink != nullptr) {
          card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                   frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
+@@ -33,7 +34,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
+             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+             {false}, execution.work, execution.device.stream);
+     } else {
+-        ops::speculative_accept_greedy_drafts(
++        ops::speculative_accept_coupled_drafts(
+             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
+             frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
+             frame.accepted_drafts,
 diff --git a/src/models/qwen3_5/program/storage/context.cpp b/src/models/qwen3_5/program/storage/context.cpp
 index 9085edcc..3bb9c685 100644
 --- a/src/models/qwen3_5/program/storage/context.cpp
@@ -8744,6 +8905,54 @@ index 176ff02d..4abded7a 100644
      case 512:
          launch_all<16>(x, qk, value_z, tokens, code_data, scale_data, qkv_data, z_data, stream);
          return;
+diff --git a/src/ops/kernel/sampling.cuh b/src/ops/kernel/sampling.cuh
+index c4cd3440..3038e15e 100644
+--- a/src/ops/kernel/sampling.cuh
++++ b/src/ops/kernel/sampling.cuh
+@@ -94,17 +94,8 @@ __launch_bounds__(kSamplerBlock) __global__
+     }
+ 
+     if (tid != 0) { return; }
+-    const int support = n_support;
+-    const float u     = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
+-    float acc         = 0.0f;
+-    int picked        = cand_idx[support - 1];
+-    for (int j = 0; j < support; ++j) {
+-        acc += prob[j]; // prob is normalized: goal == u
+-        if (u < acc) {
+-            picked = cand_idx[j];
+-            break;
+-        }
+-    }
++    const float u    = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
++    const int picked = cand_idx[sampling_pick_rank(prob, n_support, u)];
+     if (!sampling_selected_logit_is_finite(logits, base, picked)) {
+         out[row] = kSamplerNonFiniteToken;
+         return;
+@@ -294,19 +285,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
+ 
+     sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
+     if (tid == 0) {
+-        const int support = n_support;
+-        const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
+-        float acc         = 0.0f;
+-        int picked        = cand_idx[support - 1];
+-        float picked_val  = cand_val[support - 1];
+-        for (int j = 0; j < support; ++j) {
+-            acc += prob[j];
+-            if (u < acc) {
+-                picked     = cand_idx[j];
+-                picked_val = cand_val[j];
+-                break;
+-            }
+-        }
++        const float u          = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
++        const int rank         = sampling_pick_rank(prob, n_support, u);
++        const int picked       = cand_idx[rank];
++        const float picked_val = cand_val[rank];
+         // The candidate's own adjusted value stands in for the logit: this kernel is fed by the
+         // partial/group workspace and never receives the logits themselves.
+         if (!sampling_value_is_finite(picked_val)) {
 diff --git a/src/ops/kernel/sampling_device.cuh b/src/ops/kernel/sampling_device.cuh
 index b8d24bc0..d3136334 100644
 --- a/src/ops/kernel/sampling_device.cuh
@@ -8835,6 +9044,241 @@ index b8d24bc0..d3136334 100644
  }
  
  } // namespace ninfer::ops
+diff --git a/src/ops/kernel/speculative_round.cuh b/src/ops/kernel/speculative_round.cuh
+index 0c289216..f10ebd9e 100644
+--- a/src/ops/kernel/speculative_round.cuh
++++ b/src/ops/kernel/speculative_round.cuh
+@@ -367,16 +367,16 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
+ // advances the target length. The greedy branch
+ // (config temperature <= 0) is bit-identical to the original argmax accept: keep
+ // the longest draft prefix whose target argmax matches, then take the target
+-// argmax at the divergence column. The sampling branch (temperature > 0) runs
+-// distribution-correct speculative rejection sampling over the verify logits with
+-// a one-hot (greedy) draft: accept drafts[i] with probability p_i(drafts[i]) under
+-// the truncated target distribution, resample from the masked residual on the
+-// first rejection, and draw a bonus from the last column when every draft accepts.
+-// The draft-proposal path stays greedy, so q is one-hot and the accept test
+-// collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
+-// threads; only thread 0 performs the sequential accept/commit while the whole
+-// block cooperates on the per-column truncated-distribution build.
+-__launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
++// argmax at the divergence column. The sampling branch (temperature > 0) draws
++// each column's token from its truncated target distribution with the decode key
++// of the position it fills, exactly as sample() would, keeps the drafts while they
++// equal those draws, and commits the first draw that differs (or the last column's
++// draw when every draft matched). Every committed token is therefore the target's
++// own sample whatever was drafted, and a greedy draft survives with probability
++// p_i(draft). Launch with a single block of kSamplerBlock threads; only thread 0
++// performs the sequential accept/commit while the whole block cooperates on the
++// per-column truncated-distribution build.
++__launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_drafts_kernel(
+     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
+     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
+     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
+@@ -514,31 +514,12 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
+         // The loop leaves at the barrier below once the row is decided, so no thread reads the
+         // shared flag here while thread 0 may be writing it.
+         if (tid == 0) {
+-            const int L = L_sh;
+-            if (i < extent) {
+-                const int d = row_drafts[i];
+-                float pd    = 0.0f;
+-                for (int j = 0; j < n_support; ++j) {
+-                    if (cand_idx[j] == d) {
+-                        pd = prob[j];
+-                        break;
+-                    }
+-                }
+-                const float u =
+-                    sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
+-                if (u < pd) {
+-                    a_sh = i + 1; // accept drafts[i], keep verifying
+-                } else {
+-                    const float ur = sampling_uniform(cfg.seed, L + i + 1,
+-                                                      kSamplePurposeSpeculativeCorrection, 0u);
+-                    tstar_sh       = sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
+-                    done_sh        = 1;
+-                }
++            const float u = sampling_uniform(cfg.seed, L_sh + i + 1, kSamplePurposeDecode, 0u);
++            const int t   = cand_idx[sampling_pick_rank(prob, n_support, u)];
++            if (i < extent && t == row_drafts[i]) {
++                a_sh = i + 1; // the draft is the column's own draw: keep verifying
+             } else {
+-                // Every draft accepted: bonus token from the last verify column.
+-                const float u =
+-                    sampling_uniform(cfg.seed, L + extent + 1, kSamplePurposeSpeculativeBonus, 0u);
+-                tstar_sh = sampling_pick_from_support(cand_idx, prob, n_support, -1, u);
++                tstar_sh = t;
+                 done_sh  = 1;
+             }
+         }
+@@ -855,38 +836,20 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
+                 int a            = 0;
+                 int tstar        = 0;
+                 float tstar_prob = 0.0f;
++                // The coupled acceptance of speculative_accept_coupled_drafts_kernel.
+                 for (int i = 0; i <= extent; ++i) {
+                     const int n            = workspace.dist_support[i];
+                     const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
+                     const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
+-                    if (i < extent) {
+-                        const int d = row_drafts[i];
+-                        float pd    = 0.0f;
+-                        for (int j = 0; j < n; ++j) {
+-                            if (dist_idx[j] == d) {
+-                                pd = dist_prob[j];
+-                                break;
+-                            }
+-                        }
+-                        const float u           = sampling_uniform(cfg.seed, L + i + 1,
+-                                                                   kSamplePurposeSpeculativeAccept, 0u);
+-                        const bool accept_draft = u < pd;
+-                        if (accept_draft) {
+-                            a = i + 1;
+-                            continue;
+-                        }
+-                        const float ur = sampling_uniform(cfg.seed, L + i + 1,
+-                                                          kSamplePurposeSpeculativeCorrection, 0u);
+-
+-                        tstar      = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+-                        tstar_prob = dist_prob[0];
+-
+-                        break;
++                    const float u = sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeDecode, 0u);
++                    const int t   = dist_idx[sampling_pick_rank(dist_prob, n, u)];
++                    if (i < extent && t == row_drafts[i]) {
++                        a = i + 1;
++                        continue;
+                     }
+-                    const float u = sampling_uniform(cfg.seed, L + extent + 1,
+-                                                     kSamplePurposeSpeculativeBonus, 0u);
+-                    tstar         = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
+-                    tstar_prob    = dist_prob[0];
++                    tstar      = t;
++                    tstar_prob = dist_prob[0];
++                    break;
+                 }
+                 // Dense only: this statement lives in the else of `if constexpr (SparseProposal)`, so it
+                 // is instantiated with SparseProposal == false and token counts are updated.
+@@ -901,60 +864,6 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
+         }
+         return;
+     }
+-
+-    sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
+-
+-    if (tid == 0) {
+-        workspace.dist_support[col] = n_support;
+-        for (int j = 0; j < n_support; ++j) {
+-            const int off            = sampling_dist_offset(col, j);
+-            workspace.dist_idx[off]  = cand_idx[j];
+-            workspace.dist_prob[off] = prob[j];
+-        }
+-        workspace.group_done[col] = 0;
+-        __threadfence();
+-        const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
+-        if (done_cols == extent + 1) {
+-            const int L = lengths[row];
+-            int a       = 0;
+-            int tstar   = 0;
+-            float tstar_prob = 0.0f;
+-            for (int i = 0; i <= extent; ++i) {
+-                const int n            = workspace.dist_support[i];
+-                const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
+-                const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
+-                if (i < extent) {
+-                    const int d = row_drafts[i];
+-                    float pd    = 0.0f;
+-                    for (int j = 0; j < n; ++j) {
+-                        if (dist_idx[j] == d) {
+-                            pd = dist_prob[j];
+-                            break;
+-                        }
+-                    }
+-                    const float u =
+-                        sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
+-                    if (u < pd) {
+-                        a = i + 1;
+-                        continue;
+-                    }
+-                    const float ur = sampling_uniform(cfg.seed, L + i + 1,
+-                                                      kSamplePurposeSpeculativeCorrection, 0u);
+-                    tstar          = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+-                    tstar_prob     = dist_prob[0];
+-                    break;
+-                }
+-                const float u =
+-                    sampling_uniform(cfg.seed, L + extent + 1, kSamplePurposeSpeculativeBonus, 0u);
+-                tstar      = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
+-                tstar_prob = dist_prob[0];
+-            }
+-            speculative_store_accept_result<true>(row_drafts, k, row, a, tstar, lengths, anchors,
+-                                                  row_tokens, licensed_counts, accepted, &cfg,
+-                                                  sampling_value_is_finite(tstar_prob));
+-            *workspace.speculative_finalize_count = 0;
+-        }
+-    }
+ }
+ 
+ __global__ void speculative_select_accepted_hidden_kernel(const __nv_bfloat16* hidden,
+diff --git a/src/ops/launcher/speculative_round.cu b/src/ops/launcher/speculative_round.cu
+index c256d015..174d5b09 100644
+--- a/src/ops/launcher/speculative_round.cu
++++ b/src/ops/launcher/speculative_round.cu
+@@ -69,20 +69,20 @@ void speculative_overlay_copy_proposals_launch(const Tensor& copy_rows, const Te
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+-void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+-                                             const Tensor& drafts, const Tensor& current_extents,
+-                                             Tensor& lengths, Tensor& anchors,
+-                                             Tensor& licensed_tokens, Tensor& licensed_counts,
+-                                             Tensor& accepted, std::int32_t token_domain,
+-                                             const SamplingConfig* configs, DeviceSpan workspace,
+-                                             cudaStream_t stream) {
++void speculative_accept_coupled_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
++                                              const Tensor& drafts, const Tensor& current_extents,
++                                              Tensor& lengths, Tensor& anchors,
++                                              Tensor& licensed_tokens, Tensor& licensed_counts,
++                                              Tensor& accepted, std::int32_t token_domain,
++                                              const SamplingConfig* configs, DeviceSpan workspace,
++                                              cudaStream_t stream) {
+     const std::int32_t physical_rows = logits.ne[0];
+     const std::int32_t cols          = drafts.ne[0] + 1;
+     const std::int32_t batch         = drafts.ne[1];
+     const SamplingWorkspaceLayout layout =
+         make_sampling_workspace_layout(token_domain, cols, kSpeculativeSamplerMaxColumns);
+     if (!layout.multiblock) {
+-        speculative_accept_greedy_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
++        speculative_accept_coupled_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
+             static_cast<const std::int32_t*>(target_tokens.data),
+             static_cast<const __nv_bfloat16*>(logits.data),
+             static_cast<const std::int32_t*>(drafts.data),
+diff --git a/src/ops/launcher/speculative_round.h b/src/ops/launcher/speculative_round.h
+index 5e1c0577..69e5aab4 100644
+--- a/src/ops/launcher/speculative_round.h
++++ b/src/ops/launcher/speculative_round.h
+@@ -19,13 +19,13 @@ void speculative_overlay_copy_proposals_launch(const Tensor& copy_rows, const Te
+                                                Tensor& drafts, Tensor& candidates,
+                                                Tensor& proposal_q, cudaStream_t stream);
+ 
+-void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+-                                             const Tensor& drafts, const Tensor& current_extents,
+-                                             Tensor& lengths, Tensor& anchors,
+-                                             Tensor& licensed_tokens, Tensor& licensed_counts,
+-                                             Tensor& accepted, std::int32_t token_domain,
+-                                             const SamplingConfig* configs, DeviceSpan workspace,
+-                                             cudaStream_t stream);
++void speculative_accept_coupled_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
++                                              const Tensor& drafts, const Tensor& current_extents,
++                                              Tensor& lengths, Tensor& anchors,
++                                              Tensor& licensed_tokens, Tensor& licensed_counts,
++                                              Tensor& accepted, std::int32_t token_domain,
++                                              const SamplingConfig* configs, DeviceSpan workspace,
++                                              cudaStream_t stream);
+ 
+ void speculative_accept_sparse_drafts_launch(
+     const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
 diff --git a/src/ops/linear/bf16/bf16_gemm_mma.cuh b/src/ops/linear/bf16/bf16_gemm_mma.cuh
 index b6a05792..db5be0fc 100644
 --- a/src/ops/linear/bf16/bf16_gemm_mma.cuh
@@ -13689,6 +14133,84 @@ index 00000000..c1c560f9
 +    }
 +}
 +} // namespace ninfer::ops
+diff --git a/src/ops/wrapper/speculative_round.cpp b/src/ops/wrapper/speculative_round.cpp
+index ab1fa29b..a898dbfa 100644
+--- a/src/ops/wrapper/speculative_round.cpp
++++ b/src/ops/wrapper/speculative_round.cpp
+@@ -78,11 +78,11 @@ void require_tensor3(const Tensor& t, DType dtype, std::int32_t n0, std::int32_t
+ 
+ } // namespace
+ 
+-std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32_t token_domain,
+-                                                                      std::int32_t min_drafts,
+-                                                                      std::int32_t max_drafts,
+-                                                                      std::int32_t min_batch,
+-                                                                      std::int32_t max_batch) {
++std::size_t speculative_accept_coupled_drafts_workspace_capacity_bytes(std::int32_t token_domain,
++                                                                       std::int32_t min_drafts,
++                                                                       std::int32_t max_drafts,
++                                                                       std::int32_t min_batch,
++                                                                       std::int32_t max_batch) {
+     if (token_domain <= 0 || min_drafts <= 0 || max_drafts < min_drafts || min_batch <= 0 ||
+         max_batch < min_batch || max_drafts == std::numeric_limits<std::int32_t>::max()) {
+         throw std::invalid_argument("speculative accept workspace: invalid draft interval");
+@@ -180,28 +180,28 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
+         copy_rows, copy_drafts, copy_candidates, copy_q, drafts, candidates, proposal_q, stream);
+ }
+ 
+-void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
+-                                      const Tensor& drafts, const Tensor& current_extents,
+-                                      Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+-                                      Tensor& licensed_counts, Tensor& accepted,
+-                                      std::int32_t token_domain, const SamplingConfig* configs,
+-                                      WorkspaceArena& workspace, cudaStream_t stream) {
+-    constexpr const char* op = "speculative_accept_greedy_drafts";
++void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor& logits,
++                                       const Tensor& drafts, const Tensor& current_extents,
++                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
++                                       Tensor& licensed_counts, Tensor& accepted,
++                                       std::int32_t token_domain, const SamplingConfig* configs,
++                                       WorkspaceArena& workspace, cudaStream_t stream) {
++    constexpr const char* op = "speculative_accept_coupled_drafts";
+     const std::int32_t k     = drafts.ne[0];
+     const std::int32_t batch = drafts.ne[1];
+-    if (k < 1) { throw std::invalid_argument("speculative_accept_greedy_drafts: K must be >=1"); }
++    if (k < 1) { throw std::invalid_argument("speculative_accept_coupled_drafts: K must be >=1"); }
+     if (batch < 1) {
+-        throw std::invalid_argument("speculative_accept_greedy_drafts: B must be >=1");
++        throw std::invalid_argument("speculative_accept_coupled_drafts: B must be >=1");
+     }
+     require_matrix(target_tokens, DType::I32, k + 1, batch, op, "target_tokens");
+     require_dtype(logits, DType::BF16, op, "logits");
+     if (logits.ne[0] <= 0 || logits.ne[1] != k + 1 || logits.ne[2] != batch || logits.ne[3] != 1) {
+         throw std::invalid_argument(
+-            "speculative_accept_greedy_drafts: logits must be [physical_rows,K+1,B]");
++            "speculative_accept_coupled_drafts: logits must be [physical_rows,K+1,B]");
+     }
+     if (token_domain <= 0 || token_domain > logits.ne[0]) {
+         throw std::invalid_argument(
+-            "speculative_accept_greedy_drafts: token_domain must be in [1, logits.ne[0]]");
++            "speculative_accept_coupled_drafts: token_domain must be in [1, logits.ne[0]]");
+     }
+     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+     require_vector(current_extents, DType::I32, batch, op, "current_extents");
+@@ -211,13 +211,13 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
+     require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
+     require_vector(accepted, DType::I32, batch, op, "accepted");
+     if (configs == nullptr) {
+-        throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
++        throw std::invalid_argument("speculative_accept_coupled_drafts: configs must be non-null");
+     }
+     auto scratch_scope = workspace.scope();
+     const std::size_t bytes =
+-        speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
++        speculative_accept_coupled_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
+     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
+-    detail::speculative_accept_greedy_drafts_launch(
++    detail::speculative_accept_coupled_drafts_launch(
+         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
+         licensed_counts, accepted, token_domain, configs, scratch, stream);
+ }
 diff --git a/src/product/cuda_memory_options.h b/src/product/cuda_memory_options.h
 new file mode 100644
 index 00000000..62725f57
@@ -22099,6 +22621,277 @@ index ef0697d8..67b8c909 100644
      if (total != kExpectedUnrouted) {
          std::cerr << "route coverage changed: " << total << " unrouted schedules, expected "
                    << kExpectedUnrouted
+diff --git a/tests/ops/test_speculative_round.cpp b/tests/ops/test_speculative_round.cpp
+index 30bc01e4..b4c2fe22 100644
+--- a/tests/ops/test_speculative_round.cpp
++++ b/tests/ops/test_speculative_round.cpp
+@@ -417,7 +417,8 @@ struct SparseAcceptSuite {
+                                         const std::vector<std::int32_t>& extents,
+                                         const std::vector<std::int32_t>& initial_lengths,
+                                         const std::vector<ops::SamplingConfig>& configs,
+-                                        const std::vector<std::int32_t>& token_counts) {
++                                        const std::vector<std::int32_t>& token_counts,
++                                        bool coupled = false) {
+         SparseExpected expected{
+             .licensed_tokens = std::vector<std::int32_t>(kSparseColumns * kSparseBatch, 0),
+             .licensed_counts = std::vector<std::int32_t>(kSparseBatch),
+@@ -433,6 +434,23 @@ struct SparseAcceptSuite {
+                 const TargetDistribution target = sparse_target_distribution(
+                     logits, row, column, configs[static_cast<std::size_t>(row)], token_counts,
+                     drafts);
++                // Coupled verification (speculative_accept_coupled_drafts): every live column
++                // draws its token with the decode key of the position it fills, and a draft
++                // survives exactly when it equals that draw.
++                if (coupled && configs[static_cast<std::size_t>(row)].temperature > 0.0f) {
++                    const double uniform =
++                        oracle_uniform(configs[static_cast<std::size_t>(row)].seed,
++                                       initial_lengths[static_cast<std::size_t>(row)] + column + 1,
++                                       ops::kSamplePurposeDecode);
++                    const int drawn = sample_target_distribution(target, uniform);
++                    if (column < extent &&
++                        drawn == drafts[static_cast<std::size_t>(row) * kSparseDrafts + column]) {
++                        ++accepted_count;
++                        continue;
++                    }
++                    terminal_token = drawn;
++                    break;
++                }
+                 if (column == extent) {
+                     const double uniform =
+                         oracle_uniform(configs[static_cast<std::size_t>(row)].seed,
+@@ -504,7 +522,7 @@ struct SparseAcceptSuite {
+             expected_override != nullptr
+                 ? *expected_override
+                 : sparse_accept_oracle(logits, drafts, candidate_ids, proposal_q, extents,
+-                                       initial_lengths, host_configs, token_counts);
++                                       initial_lengths, host_configs, token_counts, mtp_onehot);
+ 
+         DeviceBuffer d_target_tokens                    = to_device(target_tokens);
+         DeviceBuffer d_logits                           = to_device(logits);
+@@ -557,7 +575,7 @@ struct SparseAcceptSuite {
+         Tensor accepted_tensor(d_accepted.data(), DType::I32, {kSparseBatch});
+         const std::size_t workspace_bytes =
+             mtp_onehot
+-                ? ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
++                ? ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
+                       kSparseTokenDomain, kSparseDrafts, kSparseDrafts, kSparseBatch, kSparseBatch)
+                 : ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                       kSparseTokenDomain, envelope, kSparseDrafts, kSparseDrafts, kSparseBatch,
+@@ -566,7 +584,7 @@ struct SparseAcceptSuite {
+         WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+         const auto launch = [&](cudaStream_t stream) {
+             if (mtp_onehot) {
+-                ops::speculative_accept_greedy_drafts(
++                ops::speculative_accept_coupled_drafts(
+                     target_tensor, logits_tensor, drafts_tensor, extent_tensor, lengths_tensor,
+                     anchors_tensor, licensed_tensor, licensed_counts_tensor, accepted_tensor,
+                     kSparseTokenDomain, static_cast<const ops::SamplingConfig*>(d_configs.p),
+@@ -676,9 +694,9 @@ struct SparseAcceptSuite {
+                     cuda_synchronize();
+                     executable.launch(stream);
+                     cuda_synchronize(stream);
+-                    const auto wanted = sparse_accept_oracle(current_logits, drafts, candidate_ids,
+-                                                             current_q, next_extents, next_lengths,
+-                                                             host_configs, token_counts);
++                    const auto wanted = sparse_accept_oracle(
++                        current_logits, drafts, candidate_ids, current_q, next_extents,
++                        next_lengths, host_configs, token_counts, mtp_onehot);
+                     failures += check_result(wanted, " replay " + std::to_string(pass));
+                     if (change_inputs) {
+                         failures += verify_exact(
+@@ -1199,9 +1217,9 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
+     Tensor num_sampled(d_num.data(), DType::I32, {1});
+     Tensor accepted(d_accepted.data(), DType::I32, {1});
+     const std::size_t workspace_bytes =
+-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
++        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
+     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+-    ops::speculative_accept_greedy_drafts(
++    ops::speculative_accept_coupled_drafts(
+         targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
+         token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+     cuda_synchronize();
+@@ -1280,7 +1298,7 @@ int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
+                                ops::SamplingConfig{}, token_counts, expected);
+ }
+ 
+-int masked_greedy_drafts_case(int k, int domain, bool stochastic, int rejection) {
++int masked_coupled_drafts_case(int k, int domain, bool stochastic, int rejection) {
+     const int words = (domain + 31) / 32;
+     std::vector<std::uint32_t> mask(words * (k + 1), 0);
+     std::vector<int> targets(k + 1, 0), drafts(k), counts(domain, 0);
+@@ -1345,6 +1363,63 @@ int deterministic_sampling_case() {
+                                token_counts, expected);
+ }
+ 
++// The coupling contract between the two Ops: drafts that sample() draws from the verification
++// columns themselves, each with the decode key of the position it fills, are all kept and the
++// terminal is sample()'s draw of the bonus column; a draft replaced at `mismatch` ends the round
++// there with that column's own draw. Both Ops must make the same draw from the same column on
++// every route they pick for the domain.
++int coupled_sample_case(int token_domain, int k, int mismatch) {
++    const std::int32_t initial_length = 700;
++    std::vector<std::uint16_t> logits(static_cast<std::size_t>(token_domain) * (k + 1));
++    std::uint64_t state = 0x9E3779B97F4A7C15ull ^ static_cast<std::uint64_t>(token_domain * 64 + k);
++    for (auto& logit : logits) {
++        state = state * 6364136223846793005ull + 1442695040888963407ull;
++        // Mostly flat noise with a few strong candidates per column, like a language model's head.
++        const double unit = static_cast<double>(state >> 11) * (1.0 / 9007199254740992.0);
++        logit             = f32_to_bf16(static_cast<float>(unit < 0.002 ? 6.0 + 4.0 * unit / 0.002
++                                                                        : 8.0 * unit - 4.0));
++    }
++    ops::SamplingConfig config{};
++    config.temperature = 0.7f;
++    config.top_k       = 20;
++    config.top_p       = 0.95f;
++    config.min_p       = 0.01f;
++    config.seed        = 0xC0FFEEull + static_cast<std::uint64_t>(k);
++
++    DeviceBuffer d_logits = to_device(logits);
++    DeviceBuffer d_config = device_config(config);
++    DeviceBuffer d_out    = to_device<std::int32_t>({0});
++    WorkspaceArena workspace(
++        std::max<std::size_t>(256, ops::sampling_workspace_capacity_bytes(token_domain, 1, 1)));
++    std::vector<std::int32_t> drawn(static_cast<std::size_t>(k + 1));
++    for (int column = 0; column <= k; ++column) {
++        DeviceBuffer d_position = to_device<std::int32_t>({initial_length + column + 1});
++        const Tensor rows(static_cast<std::uint16_t*>(d_logits.p) +
++                              static_cast<std::size_t>(column) * token_domain,
++                          DType::BF16, {token_domain, 1});
++        Tensor out(d_out.p, DType::I32, {1});
++        const Tensor position(d_position.p, DType::I32, {1});
++        ops::sample(rows, out, token_domain, static_cast<const ops::SamplingConfig*>(d_config.p),
++                    position, ops::kSamplePurposeDecode, workspace, nullptr);
++        cuda_synchronize();
++        drawn[static_cast<std::size_t>(column)] = from_device<std::int32_t>(d_out, 1)[0];
++    }
++    std::vector<std::int32_t> drafts(drawn.begin(), drawn.end() - 1);
++    const int accepted = mismatch >= 0 && mismatch < k ? mismatch : k;
++    if (accepted < k) {
++        drafts[static_cast<std::size_t>(accepted)] =
++            (drafts[static_cast<std::size_t>(accepted)] + 1) % token_domain;
++    }
++    const auto expected = accept_state_oracle(
++        drafts, accepted, drawn[static_cast<std::size_t>(accepted)], initial_length);
++    return execute_accept_case("coupled sample() drafts domain=" + std::to_string(token_domain) +
++                                   " K=" + std::to_string(k) + " A=" + std::to_string(accepted),
++                               std::vector<std::int32_t>(static_cast<std::size_t>(k + 1), 0),
++                               logits, token_domain, drafts, initial_length, token_domain, config,
++                               std::vector<std::int32_t>(static_cast<std::size_t>(token_domain), 0),
++                               expected);
++}
++
+ int greedy_penalty_case(int token_domain) {
+     constexpr int k = 2;
+     const std::vector<std::int32_t> drafts{1, 1};
+@@ -1492,10 +1567,10 @@ int batched_sampling_workspace_stride_case() {
+     Tensor counts(d_counts.p, DType::I32, {batch});
+     Tensor accepted(d_accepted.p, DType::I32, {batch});
+     const std::size_t workspace_bytes =
+-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
++        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
+                                                                        batch);
+     WorkspaceArena workspace(workspace_bytes);
+-    ops::speculative_accept_greedy_drafts(
++    ops::speculative_accept_coupled_drafts(
+         targets, logits_tensor, draft_tensor, extents, lengths, anchors, licensed, counts, accepted,
+         token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr);
+     cuda_synchronize();
+@@ -1715,7 +1790,7 @@ int onehot_distribution_case(int k, bool graph, bool mtp_onehot = false, int for
+     Tensor output(licensed.data(), DType::I32, {width, batch});
+     Tensor output_counts(counts.data(), DType::I32, {batch});
+     Tensor output_accepted(accepted.data(), DType::I32, {batch});
+-    const auto bytes = mtp_onehot ? ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
++    const auto bytes = mtp_onehot ? ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
+                                         kSparseTokenDomain, k, k, batch, batch)
+                                   : ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                                         kSparseTokenDomain, {false}, k, k, batch, batch);
+@@ -1727,7 +1802,7 @@ int onehot_distribution_case(int k, bool graph, bool mtp_onehot = false, int for
+     {
+         const auto launch = [&] {
+             if (mtp_onehot) {
+-                ops::speculative_accept_greedy_drafts(
++                ops::speculative_accept_coupled_drafts(
+                     target, target_logits, drafts, extents, lengths, anchors, output, output_counts,
+                     output_accepted, kSparseTokenDomain,
+                     static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, stream);
+@@ -1783,6 +1858,23 @@ int onehot_distribution_case(int k, bool graph, bool mtp_onehot = false, int for
+                         continue;
+                     }
+                     const int position = 101 + column;
++                    if (mtp_onehot) {
++                        // Coupled: the column's own decode draw, kept while it equals the draft.
++                        const double uniform = oracle.oracle_uniform(configs[row].seed, position,
++                                                                     ops::kSamplePurposeDecode);
++                        double cumulative    = 0;
++                        int drawn            = 3;
++                        for (int id = 0; id < 4; ++id) {
++                            cumulative += probabilities[id];
++                            if (uniform < cumulative) {
++                                drawn = id;
++                                break;
++                            }
++                        }
++                        expected_tokens.push_back(drawn);
++                        if (column < k && drawn == 0) { continue; }
++                        break;
++                    }
+                     if (column < k && oracle.oracle_uniform(configs[row].seed, position,
+                                                             ops::kSamplePurposeSpeculativeAccept) <
+                                           probabilities[0]) {
+@@ -2002,22 +2094,22 @@ int main(int argc, char** argv) {
+         return failures == 0 ? 0 : 1;
+     }
+     const std::size_t k15 =
+-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 1);
++        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(257, 15, 15, 1, 1);
+     const std::size_t k31 =
+-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 31, 31, 1, 1);
++        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(257, 31, 31, 1, 1);
+     const std::size_t k63 =
+-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 63, 63, 1, 1);
++        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(257, 63, 63, 1, 1);
+     if (k15 == 0 || k15 != ops::sampling_workspace_capacity_bytes(257, 16, 16) || k31 <= k15 ||
+         k63 <= k31 || ops::sampling_workspace_capacity_bytes(257, 32, 32) != 0 ||
+-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 64, 64, 1, 1) != 0 ||
+-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 1, 64, 1, 1) != k63 ||
+-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 2) !=
++        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(257, 64, 64, 1, 1) != 0 ||
++        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(257, 1, 64, 1, 1) != k63 ||
++        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(257, 15, 15, 1, 2) !=
+             2 * k15) {
+         std::cerr << "speculative accept workspace did not close over K+1 sampling columns\n";
+         ++failures;
+     }
+     try {
+-        (void)ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
++        (void)ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
+         std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
+         ++failures;
+     } catch (const std::invalid_argument&) {}
+@@ -2039,7 +2131,7 @@ int main(int argc, char** argv) {
+     for (int domain : {64, 257, 248077}) {
+         for (bool stochastic : {false, true}) {
+             for (int rejection : {0, 2, 5}) {
+-                failures += masked_greedy_drafts_case(5, domain, stochastic, rejection);
++                failures += masked_coupled_drafts_case(5, domain, stochastic, rejection);
+             }
+         }
+     }
+@@ -2049,6 +2141,13 @@ int main(int argc, char** argv) {
+         }
+     }
+     failures += deterministic_sampling_case();
++    for (int domain : {64, 257, 248077}) {
++        for (int k : {1, 5, 15}) {
++            for (int mismatch : {-1, 0, k / 2}) {
++                failures += coupled_sample_case(domain, k, mismatch);
++            }
++        }
++    }
+     failures += batched_sampling_workspace_stride_case();
+     std::size_t sparse_peak = 0;
+     for (int k = 1; k <= 31; ++k) {
 diff --git a/tests/ops/tests.cmake b/tests/ops/tests.cmake
 index 3914ffe9..dccb460a 100644
 --- a/tests/ops/tests.cmake
