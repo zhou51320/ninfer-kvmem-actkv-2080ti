@@ -67,7 +67,9 @@ jobs:
         run: |
           nproc
           free -h
-          /usr/bin/time -v cmake --build build/ninfer --parallel 4 --target ninfer-serve
+          # Ninja's -k 0 keeps compiling independent translation units after
+          # failures, so the build log contains the full set of compiler errors.
+          /usr/bin/time -v cmake --build build/ninfer --parallel 4 --target ninfer-serve -- -k 0
 
       - name: Verify binary and DFlash/ActKV symbols
         run: |
@@ -93,9 +95,14 @@ jobs:
 
           ldd dist/ninfer-kvmem-actkv-2080ti \
             | tee dist/ldd-build.txt \
-            | tee /tmp/ninfer-ldd-build.txt
-          if grep -q 'not found' /tmp/ninfer-ldd-build.txt; then
-            echo 'Unresolved build-time shared-library dependency' >&2
+            | tee /tmp/ninfer-ldd-build.txt || true
+          # libcuda is supplied by the installed NVIDIA driver on the target
+          # machine and must not be bundled. Gather all other unresolved SONAMEs.
+          if grep 'not found' /tmp/ninfer-ldd-build.txt \
+              | grep -vE '^[[:space:]]*libcuda\.so\.1[[:space:]]+=> not found$' \
+              > /tmp/ninfer-unresolved-build.txt; then
+            echo 'Unresolved build-time shared-library dependencies:' >&2
+            cat /tmp/ninfer-unresolved-build.txt >&2
             exit 1
           fi
           awk '/=> \/\// {print $3} /^\/[^ ]+ \(/ {print $1}' /tmp/ninfer-ldd-build.txt \
@@ -113,11 +120,13 @@ jobs:
           # FFmpeg may also be opened by the media backend at runtime rather
           # than appearing in the executable's direct DT_NEEDED table. Bundle
           # Ubuntu 24.04's stable FFmpeg 6 SONAME family explicitly.
+          package_failures=0
           for soname in libavformat.so.60 libavcodec.so.60 libavutil.so.58 libswscale.so.7 libswresample.so.4; do
             lib=$(ldconfig -p | awk -v name="$soname" '$1 == name {print $NF; exit}')
             if [ -z "$lib" ] || [ ! -f "$lib" ]; then
               echo "Required offline runtime dependency not installed: $soname" >&2
-              exit 1
+              package_failures=$((package_failures + 1))
+              continue
             fi
             cp -L "$lib" "dist/lib/$soname"
           done
@@ -132,19 +141,32 @@ jobs:
           chmod +x dist/ninfer
 
           LD_LIBRARY_PATH="$PWD/dist/lib" ldd dist/ninfer-kvmem-actkv-2080ti \
-            | tee dist/ldd-bundled.txt
-          if grep -q 'not found' dist/ldd-bundled.txt; then
-            echo 'Packaged artifact still has unresolved shared-library dependencies' >&2
-            exit 1
+            | tee dist/ldd-bundled.txt || true
+          if grep 'not found' dist/ldd-bundled.txt \
+              | grep -vE '^[[:space:]]*libcuda\.so\.1[[:space:]]+=> not found$' \
+              > /tmp/ninfer-unresolved-bundled.txt; then
+            echo 'Packaged artifact has unresolved runtime dependencies:' >&2
+            cat /tmp/ninfer-unresolved-bundled.txt >&2
+            package_failures=$((package_failures + 1))
           fi
-          grep -q 'libavformat.so.60 => .*/dist/lib/libavformat.so.60' dist/ldd-bundled.txt
-          LD_LIBRARY_PATH="$PWD/dist/lib" dist/ninfer --version
+          if ! grep -q 'libavformat.so.60 => .*/dist/lib/libavformat.so.60' dist/ldd-bundled.txt; then
+            echo 'libavformat.so.60 is not resolving from the artifact bundle' >&2
+            package_failures=$((package_failures + 1))
+          fi
+          if ! LD_LIBRARY_PATH="$PWD/dist/lib" dist/ninfer --version; then
+            echo 'Packaged executable --version smoke test failed' >&2
+            package_failures=$((package_failures + 1))
+          fi
 
           printf 'Run offline with: ./ninfer --version\n' > dist/README.txt
 
           printf 'Packaged files:\n'
           find dist -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
           tar -C dist -czf ninfer-kvmem-actkv-2080ti-sm75-cuda13.tar.gz .
+          if [ "$package_failures" -ne 0 ]; then
+            echo "Packaging validation found $package_failures failure(s); see all diagnostics above." >&2
+            exit 1
+          fi
 
       - name: Upload RTX 2080 Ti artifact
         uses: actions/upload-artifact@v4
