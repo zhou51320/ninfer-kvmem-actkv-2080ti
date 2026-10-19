@@ -92,7 +92,13 @@ jobs:
           patchelf --set-rpath '$ORIGIN:$ORIGIN/lib' dist/ninfer-kvmem-actkv-2080ti
 
           ldd dist/ninfer-kvmem-actkv-2080ti \
-            | awk '/=> \/\// {print $3} /^\/[^ ]+ \(/ {print $1}' \
+            | tee dist/ldd-build.txt \
+            | tee /tmp/ninfer-ldd-build.txt
+          if grep -q 'not found' /tmp/ninfer-ldd-build.txt; then
+            echo 'Unresolved build-time shared-library dependency' >&2
+            exit 1
+          fi
+          awk '/=> \/\// {print $3} /^\/[^ ]+ \(/ {print $1}' /tmp/ninfer-ldd-build.txt \
             | sort -u \
             | while read -r lib; do
                 [ -n "$lib" ] || continue
@@ -103,6 +109,38 @@ jobs:
                 esac
                 cp -L "$lib" "dist/lib/$base"
               done
+
+          # FFmpeg may also be opened by the media backend at runtime rather
+          # than appearing in the executable's direct DT_NEEDED table. Bundle
+          # Ubuntu 24.04's stable FFmpeg 6 SONAME family explicitly.
+          for soname in libavformat.so.60 libavcodec.so.60 libavutil.so.58 libswscale.so.7 libswresample.so.4; do
+            lib=$(ldconfig -p | awk -v name="$soname" '$1 == name {print $NF; exit}')
+            if [ -z "$lib" ] || [ ! -f "$lib" ]; then
+              echo "Required offline runtime dependency not installed: $soname" >&2
+              exit 1
+            fi
+            cp -L "$lib" "dist/lib/$soname"
+          done
+
+          cat > dist/ninfer <<'EOF'
+          #!/bin/sh
+          set -eu
+          HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$HERE/ninfer-kvmem-actkv-2080ti" "$@"
+          EOF
+          chmod +x dist/ninfer
+
+          LD_LIBRARY_PATH="$PWD/dist/lib" ldd dist/ninfer-kvmem-actkv-2080ti \
+            | tee dist/ldd-bundled.txt
+          if grep -q 'not found' dist/ldd-bundled.txt; then
+            echo 'Packaged artifact still has unresolved shared-library dependencies' >&2
+            exit 1
+          fi
+          grep -q 'libavformat.so.60 => .*/dist/lib/libavformat.so.60' dist/ldd-bundled.txt
+          LD_LIBRARY_PATH="$PWD/dist/lib" dist/ninfer --version
+
+          printf 'Run offline with: ./ninfer --version\n' > dist/README.txt
 
           printf 'Packaged files:\n'
           find dist -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
