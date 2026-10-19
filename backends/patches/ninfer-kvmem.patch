@@ -12516,10 +12516,18 @@ index 206237ee..40484bf5 100644
  // The f16 value loaders this kernel needs now live in ops/kv_cache/int8_g64_codec.cuh, beside their
  // bf16 counterparts: kv_cache_int8_dequant_f16x8_from and kv_cache_int4_dequant_f16x8_from. They
 diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh b/src/ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh
-index 4953390c..9a61b761 100644
+index 4953390c..7bbc2fec 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh
 +++ b/src/ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh
-@@ -62,6 +62,14 @@ struct CausalPromptI8FastStage {
+@@ -35,6 +35,7 @@
+ #include <math_constants.h>
+ 
+ #include "ops/kv_cache/int8_g64_codec.cuh"
++#include "ops/common/mma.cuh"
+ #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
+ 
+ #include <cstdint>
+@@ -62,6 +63,14 @@ struct CausalPromptI8FastStage {
  };
  inline constexpr int kCausalPromptI8FastStageBytes = CausalPromptI8FastStage<false>::Bytes;
  
@@ -12534,7 +12542,7 @@ index 4953390c..9a61b761 100644
  // Each warp owns 16 query rows. Eight warps fill an SM's register file; four warps serve
  // launches too narrow to occupy every SM with 128-row CTAs.
  template <int Warps, bool PackedValues = false>
-@@ -70,7 +78,11 @@ struct CausalPromptI8FastShape {
+@@ -70,7 +79,11 @@ struct CausalPromptI8FastShape {
      static constexpr int Threads   = Warps * 32;
      static constexpr int Br        = Warps * 16;
      static constexpr int QBytes    = Br * kCausalPromptHeadDim;
@@ -12547,7 +12555,7 @@ index 4953390c..9a61b761 100644
  };
  
  // A 64-key FP16 partial is bounded by 64 * 127 * max_scale (every probability is at most one).
-@@ -81,7 +93,10 @@ inline constexpr float kCausalPromptI8FastPackedF16PartialScaleLimit = 64.0f;
+@@ -81,16 +94,16 @@ inline constexpr float kCausalPromptI8FastPackedF16PartialScaleLimit = 64.0f;
  
  static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
  static_assert(kCausalPromptI8FastGroups == 4);
@@ -12559,7 +12567,17 @@ index 4953390c..9a61b761 100644
  
  __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
                                                                    unsigned a0, unsigned a1,
-@@ -253,7 +268,8 @@ __global__ __launch_bounds__(
+                                                                   unsigned a2, unsigned a3,
+                                                                   unsigned b0, unsigned b1) {
+-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+-                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+-                 : "+r"(c0), "+r"(c1)
+-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++    mma_f16_f16acc(c0, c1, a0, a1, a2, a3, b0, b1);
+ }
+ 
+ // One ldmatrix.trans b16 lane of an INT8 [key][d] tile holds the codes
+@@ -253,7 +266,8 @@ __global__ __launch_bounds__(
      // zero-filled and their scores masked.
      const auto commit_keys = [&](int kb) {
          if constexpr (PackedKeys) {
@@ -12569,7 +12587,7 @@ index 4953390c..9a61b761 100644
  #pragma unroll
              for (int i = 0; i < KChunksPerThread; ++i) {
                  const int chunk = tid + i * Threads;
-@@ -269,7 +285,7 @@ __global__ __launch_bounds__(
+@@ -269,7 +283,7 @@ __global__ __launch_bounds__(
      // packed) and their scales, all contiguous in the cache. Keys past the CTA's last visible key
      // are zero-filled so masked columns stay finite.
      const auto issue_tile = [&](int kb) {
@@ -12578,7 +12596,7 @@ index 4953390c..9a61b761 100644
          std::int8_t* k_s    = reinterpret_cast<std::int8_t*>(base);
          std::int8_t* v_s    = k_s + kCausalPromptI8FastTileBytes;
          __half* ks_s        = reinterpret_cast<__half*>(base + Stage::KScaleOffset);
-@@ -388,7 +404,7 @@ __global__ __launch_bounds__(
+@@ -388,7 +402,7 @@ __global__ __launch_bounds__(
          tile_live    = false;
          const int k0 = kb * Bc;
          if (!warp_active || k0 > warp_max_qabs) { return; }
@@ -12587,7 +12605,7 @@ index 4953390c..9a61b761 100644
          const __nv_bfloat16* k_b16 = reinterpret_cast<const __nv_bfloat16*>(base);
          const __half* ks_s = reinterpret_cast<const __half*>(base + Stage::KScaleOffset);
          const __half* vs_s = ks_s + Bc * Groups;
-@@ -509,7 +525,7 @@ __global__ __launch_bounds__(
+@@ -509,7 +523,7 @@ __global__ __launch_bounds__(
      };
  
      const auto pv_packed = [&](int kb) {
@@ -12596,7 +12614,7 @@ index 4953390c..9a61b761 100644
          const std::int8_t* v_s =
              reinterpret_cast<const std::int8_t*>(base) + kCausalPromptI8FastTileBytes;
          const __half* vs_s =
-@@ -572,7 +588,8 @@ __global__ __launch_bounds__(
+@@ -572,7 +586,8 @@ __global__ __launch_bounds__(
              return;
          }
          const std::int8_t* v_s =
@@ -12606,7 +12624,7 @@ index 4953390c..9a61b761 100644
          const __half* vs_s =
              reinterpret_cast<const __half*>(v_s + kCausalPromptI8FastTileBytes) + Bc * Groups;
          const __half2 mul   = __float2half2_rn(ldexpf(1.0f, -tile_shift));
-@@ -654,17 +671,33 @@ __global__ __launch_bounds__(
+@@ -654,17 +669,33 @@ __global__ __launch_bounds__(
          }
      };
  
@@ -12716,7 +12734,7 @@ index a37cb7b5..0572a5e5 100644
                  width, static_cast<float*>(partials.rows.data),
                  static_cast<float2*>(partials.stats.data));
 diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cuh b/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cuh
-index 39b0c7e6..7d3103d8 100644
+index 39b0c7e6..798d29d6 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cuh
 +++ b/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cuh
 @@ -30,6 +30,7 @@
@@ -12736,6 +12754,18 @@ index 39b0c7e6..7d3103d8 100644
  };
  
  // A 64-key FP16 partial is bounded by 64 * 6 * max_scale (every probability is at most one).
+@@ -93,10 +94,7 @@ __device__ __forceinline__ void causal_prompt_rotated_fast_mma_f16_acc(unsigned&
+                                                                        unsigned a0, unsigned a1,
+                                                                        unsigned a2, unsigned a3,
+                                                                        unsigned b0, unsigned b1) {
+-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+-                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+-                 : "+r"(c0), "+r"(c1)
+-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++    mma_f16_f16acc(c0, c1, a0, a1, a2, a3, b0, b1);
+ }
+ 
+ // Two E2M1 codes (low nibble first) widened exactly to FP16 and scaled by an exact FP16 pair.
 diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t.cuh
 index 6033c5f1..7599bedd 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/small_t.cuh
