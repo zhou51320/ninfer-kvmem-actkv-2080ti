@@ -8293,10 +8293,19 @@ index 00000000..65bf1370
 +
 +} // namespace ninfer::ops::pre_sm80
 diff --git a/src/ops/common/rowsplit_a8_mma.cuh b/src/ops/common/rowsplit_a8_mma.cuh
-index d88dd483..29cdb260 100644
+index d88dd483..1d5e1e9d 100644
 --- a/src/ops/common/rowsplit_a8_mma.cuh
 +++ b/src/ops/common/rowsplit_a8_mma.cuh
-@@ -51,8 +51,14 @@ constexpr int kWarpsM  = 4;
+@@ -38,6 +38,8 @@
+ // Nothing in the prefetch path waits on a synchronous global read.
+ 
+ #include "core/tensor.h"
++#include "ops/common/device_limits.h"
++#include "ops/common/memory.cuh"
+ 
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+@@ -51,8 +53,14 @@ constexpr int kWarpsM  = 4;
  constexpr int kWarpsN  = 4;
  constexpr int kGroup   = 64; // k per iteration: exactly one scale group
  constexpr int kWRow    = 48; // padded shared stride for a row's 32 packed bytes, 16-byte aligned
@@ -8313,7 +8322,7 @@ index d88dd483..29cdb260 100644
  constexpr int kRingBufs   = 2;
  
  __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
-@@ -86,6 +92,7 @@ __device__ __forceinline__ unsigned lds8(const void* p) {
+@@ -86,6 +94,7 @@ __device__ __forceinline__ unsigned lds8(const void* p) {
      return r;
  }
  
@@ -8321,7 +8330,7 @@ index d88dd483..29cdb260 100644
  template <int kBytes>
  __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
      const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-@@ -283,6 +290,8 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
+@@ -283,6 +292,8 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
      constexpr int kXsBytes = BN * 2;
      constexpr int kStage   = kWBytes + kHBytes + kXBytes + kXsBytes;
      constexpr int kRingBytes = BM * kRingGroups * 2;
@@ -8330,7 +8339,7 @@ index d88dd483..29cdb260 100644
  
      extern __shared__ char smem[];
      char* const s_base = smem;
-@@ -413,9 +422,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
+@@ -413,9 +424,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
          const int issued  = (g + kStages < kGroups) ? (g + kStages) : kGroups;
          const int allowed = issued - (g + 1);
          if (allowed >= 1) {
@@ -8342,7 +8351,7 @@ index d88dd483..29cdb260 100644
          }
          __syncthreads();
  
-@@ -556,6 +565,39 @@ template <class Codec, int MT, int NT, class RowMap>
+@@ -556,6 +567,39 @@ template <class Codec, int MT, int NT, class RowMap>
      return 0;
  }
  
