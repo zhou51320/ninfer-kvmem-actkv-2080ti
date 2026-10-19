@@ -10182,7 +10182,7 @@ index 331ac616..e02b487c 100644
      static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
      if (weight.padded_shape[1] != Geometry::kInputRows) {
 diff --git a/src/ops/linear/q8/q8_ksplit_mma.cuh b/src/ops/linear/q8/q8_ksplit_mma.cuh
-index 7b67b4a5..8872013c 100644
+index 7b67b4a5..778c8eef 100644
 --- a/src/ops/linear/q8/q8_ksplit_mma.cuh
 +++ b/src/ops/linear/q8/q8_ksplit_mma.cuh
 @@ -54,6 +54,19 @@ __device__ __forceinline__ unsigned q8_ksplit_bf16_pair_from_s8(unsigned values)
@@ -10265,7 +10265,7 @@ index 7b67b4a5..8872013c 100644
 +            for (int load = 0; load < kCodeLoads; ++load) {
 +                const int chunk = lane + 32 * load;
 +                if (chunk < kCodeChunks) {
-+                    next_codes[row_item][load] = sm75_global_load<uint4, Schedule::kWeightCache>(
++                    next_codes[row_item][load] = load_global<uint4, Schedule::kWeightCache>(
 +                        codes + static_cast<std::int64_t>(weight_row) * kHidden + group_k0 +
 +                        chunk * 16);
 +                }
@@ -10279,7 +10279,7 @@ index 7b67b4a5..8872013c 100644
 +                if (item < x_items) {
 +                    next_x[load] =
 +                        x_item(item, col, k8)
-+                            ? sm75_global_load<uint4, Schedule::kActivationCache>(
++                            ? load_global<uint4, Schedule::kActivationCache>(
 +                                  &x[static_cast<std::int64_t>(column_policy(column_offset + col)) *
 +                                         kHidden +
 +                                     group_k0 + warp * kTileK + k8 * 8])
@@ -10295,7 +10295,7 @@ index 7b67b4a5..8872013c 100644
 +                    const int row        = item / kScaleChunksPerRow;
 +                    const int chunk      = item - row * kScaleChunksPerRow;
 +                    const int weight_row = row_policy.weight_row(cta_row0, row);
-+                    next_scales[load]    = sm75_global_load<uint4, Schedule::kWeightCache>(
++                    next_scales[load]    = load_global<uint4, Schedule::kWeightCache>(
 +                        scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
 +                                  group_k0 / 32 + chunk * 8) *
 +                                     2);
