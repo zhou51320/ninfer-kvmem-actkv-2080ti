@@ -8293,19 +8293,20 @@ index 00000000..65bf1370
 +
 +} // namespace ninfer::ops::pre_sm80
 diff --git a/src/ops/common/rowsplit_a8_mma.cuh b/src/ops/common/rowsplit_a8_mma.cuh
-index d88dd483..1d405f52 100644
+index d88dd483..aba55332 100644
 --- a/src/ops/common/rowsplit_a8_mma.cuh
 +++ b/src/ops/common/rowsplit_a8_mma.cuh
-@@ -38,6 +38,8 @@
+@@ -38,6 +38,9 @@
  // Nothing in the prefetch path waits on a synchronous global read.
  
  #include "core/tensor.h"
 +#include "ops/common/device_limits.h"
 +#include "ops/common/memory.cuh"
++#include "ops/common/sm75_mma.cuh"
  
  #include <cuda_bf16.h>
  #include <cuda_fp16.h>
-@@ -51,8 +53,14 @@ constexpr int kWarpsM  = 4;
+@@ -51,16 +54,26 @@ constexpr int kWarpsM  = 4;
  constexpr int kWarpsN  = 4;
  constexpr int kGroup   = 64; // k per iteration: exactly one scale group
  constexpr int kWRow    = 48; // padded shared stride for a row's 32 packed bytes, 16-byte aligned
@@ -8322,7 +8323,19 @@ index d88dd483..1d405f52 100644
  constexpr int kRingBufs   = 2;
  
  __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
-@@ -86,8 +94,13 @@ __device__ __forceinline__ unsigned lds8(const void* p) {
+                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
++#if defined(NINFER_SM75)
++    ninfer::ops::sm75::mma_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
++#else
+     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                  : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++#endif
+ }
+ 
+ __device__ __forceinline__ uint4 lds128(const void* p) {
+@@ -86,8 +99,13 @@ __device__ __forceinline__ unsigned lds8(const void* p) {
      return r;
  }
  
@@ -8336,7 +8349,7 @@ index d88dd483..1d405f52 100644
      const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
      if constexpr (kBytes == 16) {
          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(addr), "l"(gmem));
-@@ -95,6 +108,7 @@ __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
+@@ -95,6 +113,7 @@ __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
          asm volatile("cp.async.ca.shared.global [%0], [%1], %2;" ::"r"(addr), "l"(gmem),
                       "n"(kBytes));
      }
@@ -8344,7 +8357,7 @@ index d88dd483..1d405f52 100644
  }
  
  // Two packed bytes hold four consecutive k as (low,high) nibble pairs; this spreads them to one
-@@ -283,6 +297,8 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
+@@ -283,6 +302,8 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
      constexpr int kXsBytes = BN * 2;
      constexpr int kStage   = kWBytes + kHBytes + kXBytes + kXsBytes;
      constexpr int kRingBytes = BM * kRingGroups * 2;
@@ -8353,7 +8366,7 @@ index d88dd483..1d405f52 100644
  
      extern __shared__ char smem[];
      char* const s_base = smem;
-@@ -391,7 +407,7 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
+@@ -391,7 +412,7 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
                                                    sizeof(__half));
              }
          }
@@ -8362,7 +8375,7 @@ index d88dd483..1d405f52 100644
      };
  
      float acc[MT][NT][4];
-@@ -413,9 +429,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
+@@ -413,9 +434,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
          const int issued  = (g + kStages < kGroups) ? (g + kStages) : kGroups;
          const int allowed = issued - (g + 1);
          if (allowed >= 1) {
@@ -8374,7 +8387,7 @@ index d88dd483..1d405f52 100644
          }
          __syncthreads();
  
-@@ -556,6 +572,39 @@ template <class Codec, int MT, int NT, class RowMap>
+@@ -556,6 +577,39 @@ template <class Codec, int MT, int NT, class RowMap>
      return 0;
  }
  
