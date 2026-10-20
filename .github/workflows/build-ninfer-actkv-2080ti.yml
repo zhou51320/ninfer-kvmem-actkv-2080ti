@@ -153,10 +153,23 @@ jobs:
             echo 'libavformat.so.60 is not resolving from the artifact bundle' >&2
             package_failures=$((package_failures + 1))
           fi
-          if ! LD_LIBRARY_PATH="$PWD/dist/lib" dist/ninfer --version; then
+          # GitHub's build container intentionally has no NVIDIA driver, so
+          # libcuda.so.1 is absent. Use CUDA's SDK stub only for this CI smoke
+          # test. It stays outside dist and is never shipped: on the offline
+          # target the real libcuda.so.1 must come from its installed driver.
+          test_driver_stub_dir=$(mktemp -d)
+          test_driver_stub=$(find /usr/local/cuda -path '*/stubs/libcuda.so' -type f -print -quit)
+          if [ -z "$test_driver_stub" ]; then
+            echo 'CUDA SDK libcuda stub is unavailable for CI smoke test' >&2
+            package_failures=$((package_failures + 1))
+          else
+            cp -L "$test_driver_stub" "$test_driver_stub_dir/libcuda.so.1"
+          fi
+          if ! LD_LIBRARY_PATH="$PWD/dist/lib:$test_driver_stub_dir" dist/ninfer --version; then
             echo 'Packaged executable --version smoke test failed' >&2
             package_failures=$((package_failures + 1))
           fi
+          rm -rf "$test_driver_stub_dir"
 
           printf 'Run offline with: ./ninfer --version\n' > dist/README.txt
 
