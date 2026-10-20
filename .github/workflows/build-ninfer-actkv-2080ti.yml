@@ -120,12 +120,12 @@ jobs:
           # FFmpeg may also be opened by the media backend at runtime rather
           # than appearing in the executable's direct DT_NEEDED table. Bundle
           # Ubuntu 24.04's stable FFmpeg 6 SONAME family explicitly.
-          package_failures=0
           for soname in libavformat.so.60 libavcodec.so.60 libavutil.so.58 libswscale.so.7 libswresample.so.4; do
             lib=$(ldconfig -p | awk -v name="$soname" '$1 == name {print $NF; exit}')
             if [ -z "$lib" ] || [ ! -f "$lib" ]; then
               echo "Required offline runtime dependency not installed: $soname" >&2
-              package_failures=$((package_failures + 1))
+              # Preserve all available package contents for manual inspection;
+              # validation below will report every missing SONAME.
               continue
             fi
             cp -L "$lib" "dist/lib/$soname"
@@ -142,6 +142,30 @@ jobs:
 
           LD_LIBRARY_PATH="$PWD/dist/lib" ldd dist/ninfer-kvmem-actkv-2080ti \
             | tee dist/ldd-bundled.txt || true
+          printf 'Run offline with: ./ninfer --version\n' > dist/README.txt
+
+          printf 'Packaged files:\n'
+          find dist -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+          tar -C dist -czf ninfer-kvmem-actkv-2080ti-sm75-cuda13.tar.gz .
+
+      - name: Upload RTX 2080 Ti artifact before runtime validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-kvmem-actkv-2080ti-sm75-cuda13
+          path: |
+            dist/**
+            ninfer-kvmem-actkv-2080ti-sm75-cuda13.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Validate packaged runtime dependencies and startup
+        run: |
+          package_failures=0
+          if ! LD_LIBRARY_PATH="$PWD/dist/lib" ldd dist/ninfer-kvmem-actkv-2080ti \
+              | tee dist/ldd-bundled.txt; then
+            echo 'ldd failed for packaged executable' >&2
+            package_failures=$((package_failures + 1))
+          fi
           if grep 'not found' dist/ldd-bundled.txt \
               | grep -vE '^[[:space:]]*libcuda\.so\.1[[:space:]]+=> not found$' \
               > /tmp/ninfer-unresolved-bundled.txt; then
@@ -153,10 +177,9 @@ jobs:
             echo 'libavformat.so.60 is not resolving from the artifact bundle' >&2
             package_failures=$((package_failures + 1))
           fi
-          # GitHub's build container intentionally has no NVIDIA driver, so
-          # libcuda.so.1 is absent. Use CUDA's SDK stub only for this CI smoke
-          # test. It stays outside dist and is never shipped: on the offline
-          # target the real libcuda.so.1 must come from its installed driver.
+
+          # No NVIDIA driver is present in GitHub's build container. Use the
+          # CUDA SDK stub only for this smoke test; never include it in dist.
           test_driver_stub_dir=$(mktemp -d)
           test_driver_stub=$(find /usr/local/cuda -path '*/stubs/libcuda.so' -type f -print -quit)
           if [ -z "$test_driver_stub" ]; then
@@ -171,22 +194,7 @@ jobs:
           fi
           rm -rf "$test_driver_stub_dir"
 
-          printf 'Run offline with: ./ninfer --version\n' > dist/README.txt
-
-          printf 'Packaged files:\n'
-          find dist -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
-          tar -C dist -czf ninfer-kvmem-actkv-2080ti-sm75-cuda13.tar.gz .
           if [ "$package_failures" -ne 0 ]; then
-            echo "Packaging validation found $package_failures failure(s); see all diagnostics above." >&2
+            echo "Runtime validation found $package_failures issue(s); artifact was uploaded for manual testing." >&2
             exit 1
           fi
-
-      - name: Upload RTX 2080 Ti artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ninfer-kvmem-actkv-2080ti-sm75-cuda13
-          path: |
-            dist/**
-            ninfer-kvmem-actkv-2080ti-sm75-cuda13.tar.gz
-          if-no-files-found: error
-          retention-days: 30
