@@ -105,17 +105,54 @@ jobs:
             cat /tmp/ninfer-unresolved-build.txt >&2
             exit 1
           fi
-          awk '/=> \/\// {print $3} /^\/[^ ]+ \(/ {print $1}' /tmp/ninfer-ldd-build.txt \
+          # Copy under the exact SONAME requested by the ELF loader. The
+          # resolved path basename may differ from the SONAME (CUDA 13 does
+          # this for versioned component libraries).
+          awk '$2 == "=>" && $3 ~ /^\// {print $1, $3} $1 ~ /^\// && $2 ~ /^\(/ {print $1, $1}' /tmp/ninfer-ldd-build.txt \
             | sort -u \
-            | while read -r lib; do
-                [ -n "$lib" ] || continue
-                base=$(basename "$lib")
-                case "$base" in
+            | while read -r soname lib; do
+                [ -n "$soname" ] && [ -n "$lib" ] || continue
+                case "$soname" in
                   libc.so*|libm.so*|libpthread.so*|librt.so*|libdl.so*|libresolv.so*|libutil.so*|ld-linux*|libcuda.so*)
                     continue ;;
                 esac
-                cp -L "$lib" "dist/lib/$base"
+                cp -L "$lib" "dist/lib/$soname"
               done
+
+          # CUDA components may be loaded lazily and thus be invisible to
+          # ldd. Include CUDA 13 runtime/cuBLAS libraries and preserve SONAME
+          # symlinks so the bundle works without an installed CUDA toolkit.
+          cuda_lib_dir=/usr/local/cuda/targets/x86_64-linux/lib
+          for pattern in 'libcudart.so*' 'libcublas.so*' 'libcublasLt.so*'; do
+            found=0
+            for lib in "$cuda_lib_dir"/$pattern; do
+              [ -e "$lib" ] || continue
+              cp -a "$lib" dist/lib/
+              found=1
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "Required CUDA runtime library family is missing: $pattern" >&2
+              exit 1
+            fi
+          done
+
+          # These libraries can be loaded only when the first CUDA operation
+          # runs. Capture their own transitive ELF dependencies too (for
+          # example libnvJitLink), which the executable's ldd cannot see.
+          for root in dist/lib/libcudart.so dist/lib/libcublas.so dist/lib/libcublasLt.so; do
+            [ -e "$root" ] || continue
+            ldd "$root" | tee -a dist/ldd-cuda-libs.txt \
+              | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3} $1 ~ /^\// && $2 ~ /^\(/ {print $1, $1}' \
+              | sort -u \
+              | while read -r soname lib; do
+                  [ -n "$soname" ] && [ -n "$lib" ] || continue
+                  case "$soname" in
+                    libc.so*|libm.so*|libpthread.so*|librt.so*|libdl.so*|libresolv.so*|libutil.so*|ld-linux*|libcuda.so*)
+                      continue ;;
+                  esac
+                  cp -L "$lib" "dist/lib/$soname"
+                done
+          done
 
           # FFmpeg may also be opened by the media backend at runtime rather
           # than appearing in the executable's direct DT_NEEDED table. Bundle
@@ -173,10 +210,23 @@ jobs:
             cat /tmp/ninfer-unresolved-bundled.txt >&2
             package_failures=$((package_failures + 1))
           fi
+          if grep 'not found' dist/ldd-cuda-libs.txt 2>/dev/null \
+              | grep -vE '^[[:space:]]*libcuda\.so\.1[[:space:]]+=> not found$' \
+              > /tmp/ninfer-unresolved-cuda.txt; then
+            echo 'Packaged CUDA libraries have unresolved runtime dependencies:' >&2
+            cat /tmp/ninfer-unresolved-cuda.txt >&2
+            package_failures=$((package_failures + 1))
+          fi
           if ! grep -q 'libavformat.so.60 => .*/dist/lib/libavformat.so.60' dist/ldd-bundled.txt; then
             echo 'libavformat.so.60 is not resolving from the artifact bundle' >&2
             package_failures=$((package_failures + 1))
           fi
+          for family in libcudart.so libcublas.so libcublasLt.so; do
+            if ! find dist/lib -maxdepth 1 -name "$family*" -print -quit | grep -q .; then
+              echo "$family runtime family is absent from the packaged CUDA libraries" >&2
+              package_failures=$((package_failures + 1))
+            fi
+          done
 
           # No NVIDIA driver is present in GitHub's build container. Use the
           # CUDA SDK stub only for this smoke test; never include it in dist.
