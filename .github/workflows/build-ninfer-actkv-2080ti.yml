@@ -71,33 +71,12 @@ jobs:
           # failures, so the build log contains the full set of compiler errors.
           /usr/bin/time -v cmake --build build/ninfer --parallel 4 --target ninfer-serve -- -k 0
 
-      - name: Verify binary and DFlash/ActKV symbols
+      - name: Locate build output and record metadata
         run: |
           BIN=$(find build/ninfer -type f -name ninfer-serve -perm -111 | head -n 1)
           test -n "$BIN"
           test -x "$BIN"
           printf 'Built binary: %s\n' "$BIN"
-          file "$BIN"
-          readelf -h "$BIN"
-          # A Turing artifact must contain the sm_75 host-side route and its
-          # 7.5 startup gate.  Without this check a stale/unpatched backend
-          # can still produce a seemingly valid binary that loads weights but
-          # rejects every RTX 2080 Ti at finalization.
-          if ! grep -Eq 'CMAKE_CUDA_ARCHITECTURES:(STRING|UNINITIALIZED)=75' build/ninfer/CMakeCache.txt; then
-            echo 'Build cache is not configured for CMAKE_CUDA_ARCHITECTURES=75' >&2
-            grep -E 'CMAKE_CUDA_ARCHITECTURES|NINFER_SM120_NATIVE' build/ninfer/CMakeCache.txt >&2 || true
-            exit 1
-          fi
-          if ! strings "$BIN" | grep -q 'compute capability 7.0, 7.5'; then
-            echo 'Binary does not contain the sm_75/Qwen3.5 7.5 startup route' >&2
-            strings "$BIN" | grep -E 'compute capability|Qwen3.5 family runtime' >&2 || true
-            exit 1
-          fi
-          strings "$BIN" | grep -qi kvmem
-          # DFlash/ActKV may be compiled into static code without retaining
-          # the feature name in the final stripped executable. Verify the
-          # checked-out integration sources and the binary independently.
-          grep -RiqE 'dflash|actkv|kvmem-lrfu' backends/ninfer kvmem
           printf 'BIN=%s\n' "$BIN" >> "$GITHUB_ENV"
           {
             printf 'backend_commit='; git -C backends/ninfer rev-parse HEAD
@@ -107,8 +86,15 @@ jobs:
 
       - name: Package executable and runtime libraries
         run: |
+          BIN=$(find build/ninfer -type f -name ninfer-serve -perm -111 | head -n 1)
+          test -n "$BIN"
           rm -rf dist
           mkdir -p dist/lib
+          {
+            printf 'backend_commit='; git -C backends/ninfer rev-parse HEAD
+            printf 'backend_tree='; git -C backends/ninfer status --porcelain=v1
+            grep -E 'CMAKE_CUDA_ARCHITECTURES|NINFER_SM120_NATIVE' build/ninfer/CMakeCache.txt || true
+          } > build/ninfer/build-config.txt
           cp "$BIN" dist/ninfer-kvmem-actkv-2080ti
           cp build/ninfer/build-config.txt dist/build-config.txt
           patchelf --set-rpath '$ORIGIN:$ORIGIN/lib' dist/ninfer-kvmem-actkv-2080ti
@@ -214,6 +200,26 @@ jobs:
             ninfer-kvmem-actkv-2080ti-sm75-cuda13.tar.gz
           if-no-files-found: error
           retention-days: 30
+
+      - name: Verify binary and DFlash/ActKV symbols
+        run: |
+          BIN=dist/ninfer-kvmem-actkv-2080ti
+          file "$BIN"
+          readelf -h "$BIN"
+          # This check intentionally runs after upload so a diagnostic artifact
+          # remains downloadable even when a validation assertion fails.
+          if ! grep -Eq 'CMAKE_CUDA_ARCHITECTURES:(STRING|UNINITIALIZED)=75' dist/build-config.txt; then
+            echo 'Build cache is not configured for CMAKE_CUDA_ARCHITECTURES=75' >&2
+            cat dist/build-config.txt >&2
+            exit 1
+          fi
+          if ! strings "$BIN" | grep -q 'compute capability 7.0, 7.5'; then
+            echo 'Binary does not contain the sm_75/Qwen3.5 7.5 startup route' >&2
+            strings "$BIN" | grep -E 'compute capability|Qwen3.5 family runtime' >&2 || true
+            exit 1
+          fi
+          strings "$BIN" | grep -qi kvmem
+          grep -RiqE 'dflash|actkv|kvmem-lrfu' backends/ninfer kvmem
 
       - name: Validate packaged runtime dependencies and startup
         run: |
