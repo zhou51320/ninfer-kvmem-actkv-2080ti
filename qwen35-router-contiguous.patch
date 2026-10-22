@@ -1,0 +1,19 @@
+diff --git a/tools/convert/qwen35_moe_gguf.py b/tools/convert/qwen35_moe_gguf.py
+index ef66fabc..23f737e1 100644
+--- a/tools/convert/qwen35_moe_gguf.py
++++ b/tools/convert/qwen35_moe_gguf.py
+@@ -354,6 +354,14 @@ def qwen3_5_35b_a3b_gguf(model, recipe, sources):
+     for name, source in direct.items():
+         recipe.assign(name, format=model.parameters[name].direct_format, method=cast_direct, source=source)
+ 
++    # Router and shared-score are direct BF16 operands, but the runtime fuses
++    # them into one native parent region.  Include these direct assignments in
++    # the format map so the grouping pass below actually coalesces them; the
++    # previous converter only tracked encoded sources and emitted two parents.
++    for layer_prefix in [f"text/layers/{i}/" for i in range(LAYERS)] + ["mtp/layers/0/"]:
++        for name in (layer_prefix + "moe/router", layer_prefix + "moe/shared_score"):
++            formats[name] = model.parameters[name].direct_format
++
+     # Keep the same parent groups as the model builder, but split a group when the
+     # mixed GGUF assigns different block types to its members.
+     for layer_prefix in [f"text/layers/{i}/" for i in range(LAYERS)] + ["mtp/layers/0/"]:
