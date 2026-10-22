@@ -88,7 +88,7 @@ jobs:
             grep -E 'CMAKE_CUDA_ARCHITECTURES|NINFER_SM120_NATIVE' build/ninfer/CMakeCache.txt >&2 || true
             exit 1
           fi
-          if ! strings "$BIN" | grep -q 'compute capability 7.5'; then
+          if ! strings "$BIN" | grep -q 'compute capability 7.0, 7.5'; then
             echo 'Binary does not contain the sm_75/Qwen3.5 7.5 startup route' >&2
             strings "$BIN" | grep -E 'compute capability|Qwen3.5 family runtime' >&2 || true
             exit 1
