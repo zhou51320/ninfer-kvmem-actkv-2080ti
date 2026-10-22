@@ -83,7 +83,7 @@ jobs:
           # 7.5 startup gate.  Without this check a stale/unpatched backend
           # can still produce a seemingly valid binary that loads weights but
           # rejects every RTX 2080 Ti at finalization.
-          if ! grep -q 'CMAKE_CUDA_ARCHITECTURES:STRING=75' build/ninfer/CMakeCache.txt; then
+          if ! grep -Eq 'CMAKE_CUDA_ARCHITECTURES:(STRING|UNINITIALIZED)=75' build/ninfer/CMakeCache.txt; then
             echo 'Build cache is not configured for CMAKE_CUDA_ARCHITECTURES=75' >&2
             grep -E 'CMAKE_CUDA_ARCHITECTURES|NINFER_SM120_NATIVE' build/ninfer/CMakeCache.txt >&2 || true
             exit 1
