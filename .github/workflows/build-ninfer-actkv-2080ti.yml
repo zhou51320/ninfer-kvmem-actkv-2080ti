@@ -79,18 +79,38 @@ jobs:
           printf 'Built binary: %s\n' "$BIN"
           file "$BIN"
           readelf -h "$BIN"
+          # A Turing artifact must contain the sm_75 host-side route and its
+          # 7.5 startup gate.  Without this check a stale/unpatched backend
+          # can still produce a seemingly valid binary that loads weights but
+          # rejects every RTX 2080 Ti at finalization.
+          if ! grep -q 'CMAKE_CUDA_ARCHITECTURES:STRING=75' build/ninfer/CMakeCache.txt; then
+            echo 'Build cache is not configured for CMAKE_CUDA_ARCHITECTURES=75' >&2
+            grep -E 'CMAKE_CUDA_ARCHITECTURES|NINFER_SM120_NATIVE' build/ninfer/CMakeCache.txt >&2 || true
+            exit 1
+          fi
+          if ! strings "$BIN" | grep -q 'compute capability 7.5'; then
+            echo 'Binary does not contain the sm_75/Qwen3.5 7.5 startup route' >&2
+            strings "$BIN" | grep -E 'compute capability|Qwen3.5 family runtime' >&2 || true
+            exit 1
+          fi
           strings "$BIN" | grep -qi kvmem
           # DFlash/ActKV may be compiled into static code without retaining
           # the feature name in the final stripped executable. Verify the
           # checked-out integration sources and the binary independently.
           grep -RiqE 'dflash|actkv|kvmem-lrfu' backends/ninfer kvmem
           printf 'BIN=%s\n' "$BIN" >> "$GITHUB_ENV"
+          {
+            printf 'backend_commit='; git -C backends/ninfer rev-parse HEAD
+            printf 'backend_tree='; git -C backends/ninfer status --porcelain=v1
+            grep -E 'CMAKE_CUDA_ARCHITECTURES|NINFER_SM120_NATIVE' build/ninfer/CMakeCache.txt || true
+          } > build/ninfer/build-config.txt
 
       - name: Package executable and runtime libraries
         run: |
           rm -rf dist
           mkdir -p dist/lib
           cp "$BIN" dist/ninfer-kvmem-actkv-2080ti
+          cp build/ninfer/build-config.txt dist/build-config.txt
           patchelf --set-rpath '$ORIGIN:$ORIGIN/lib' dist/ninfer-kvmem-actkv-2080ti
 
           ldd dist/ninfer-kvmem-actkv-2080ti \
