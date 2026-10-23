@@ -9,94 +9,123 @@
 
 本项目仅供研究学习，稳定使用可前往kvmem原作者。
 
-## 2026-10-18 更新：DFlash2 × KVMem 修复
+## 2026-10-22 更新：sm70 / sm75 源码支持
 
-ninfer 后端的 `--spec dflash2` 在 KVMem 长上下文下现已正常工作。共修复五个问题，
-完整根因分析与验证矩阵见 [docs/dflash2-kvmem-fixes-20261018.md](docs/dflash2-kvmem-fixes-20261018.md)：
+ninfer 后端新增 **sm75（RTX 20 系、TITAN RTX、T4）** 与 **sm70（Tesla V100）** 的构建支持。召回与驱逐保持 ActKV 不变。
 
-1. **envelope 短路（主因）**：草稿滑窗注意力的 `max_context` 被设成环容量 2048 并固化进
-   CUDA graph，内核守卫让绝对位置超过 2048 的草稿轮全部静默输出零——上下文一超过 ~2K
-   token 接受率就归零，与内容无关。
-2. **检索缝合污染环**：KVMem 重选换块后环里残留陈旧特征；新增 `dflash_context_floor`
-   + 逐行 `min_positions` 掩码，让 2048 滑窗只读尾部连续段。
-3. **dflash 轮缺失 `prepare_window`**：B+R 窗口填满后崩溃
-   （`KV coverage exceeds active entitlement`，tokens=53250 vs 53248）。
-4. **state-slot fork 跟随**：环 lane 跟随 StateImage 槽位变化。
-5. **draft-bypass 诊断**：`KVMEM_DFLASH_BYPASS` 记录连续空手神经轮。
-6. dflash2模型推荐，Qwen3.8-27B-GSQ-RCO-IQ3_XXS-Uncensored-MTP，或者其他低于11G容量，精度格式推荐rk8v4，或者nvfp4。
-7. bonsai2模型推荐，https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3/tree/main
-已经内置dflash2，无需再次合并
+### 改动范围
 
+最小移植，不升级上游 210 个提交：
 
-### 256K 召回复测（2026-10-18，RTX 5060 Ti，dflash2 草稿 3，nvfp4，15 轮 / 80 次工具调用）
+| 项 | 内容 |
+|---|---|
+| 新增文件 | 31 个（sm70 整套 GEMM、sm75 MMA、`pre_sm80.cuh` / `sm70_emulation.cuh` 兼容层） |
+| 接入修改 | 8 处（CMake 白名单、`mma.cuh`、`memory.cuh`、sources、`QType`、2 个 codec） |
+| GPU profile | 9 个（V100×2、TITAN RTX、2060S、2070、2070S、2080Ti、Quadro RTX 6000、T4） |
+| ActKV | **未改动**：LRFU 公式、mean-Q 打分、sink/recent 逻辑与 10-21 版一致 |
 
-| 指标 | 修复前 | 修复后 |
+### 构建
+
+```bash
+# RTX 20 系（sm75，CUDA 13.x 支持 compute_75）
+cmake -S backends/ninfer -B build-sm75 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build-sm75 --target ninfer-serve
+
+# V100（sm70，必须 CUDA 12.x；CUDA 13 已移除 Volta）
+cmake -S backends/ninfer -B build-sm70 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 \
+  -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nvcc.exe"
+cmake --build build-sm70 --target ninfer-serve
+```
+
+启动参数与现有配置一致，不需要 `--kvmem-query-scorer`（本地版本默认即 mean-Q cosine）。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| sm120a 编译 | 0 错误 |
+| 64K | prefill 427.1 tok/s / decode 45.5 tok/s / 接受率 48.1% |
+| 256K NIAH | 33/33、14/14、80 工具调用 |
+| sm75 / sm70 运行 | **未验证**（本机只有 sm120a） |
+
+### 块大小不可调
+
+尝试把页大小从 64 改到 32，编译期被断言挡住：
+
+```cpp
+static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
+```
+
+页大小同时是 fast prompt 内核的 K 方向 tile，改它需要重写 MMA 迭代与共享内存预算。48 更不可行：页表索引是 `position >> 6`，要求 2 的幂。
+
+### 文档
+
+- [sm70/sm75 移植与块大小结论（2026-10-22）](docs/kvmem-sm75-sm70-port-20261022.md)
+- [子模块 patch 恢复说明](docs/patches/README.md)
+
+## 2026-10-21 更新：ActKV LRFU 与增量 restore，新版需自行git编译。
+
+### 打分与驱逐
+
+召回打分保持不变：64-token 块的 mean key 与 query 均值的余弦，prefill 结束后一次性计算。
+
+驱逐改用 ActKV Algorithm 1（[arXiv 2609.31395](https://arxiv.org/pdf/2609.31395)）：
+
+```
+hit : KS_t = λ·KS_{t-1} + score
+miss: KS_t = λ·KS_{t-1}
+```
+
+新块从 0 开始，首次命中时被当前分数点亮。与之前 EMA（`λ·KS + (1-λ)·score`）的差别在于：EMA 是加权平均，ActKV 是衰减累积和，后者让「偶尔命中但单次分高」的块活得更久。
+
+### 增量 restore
+
+`start_restore` 不再 `truncate(0)` 后全量重映射：
+
+- 选中页按 id 稳定排序，同一逻辑页在重选后保持物理槽位；
+- 只对变化的槽位做 H2D，也只读变化的 host 记录；
+- 变化超过一半时自动回退全量，避免差异比全量还贵。
+
+| 64K 场景 | 全量 | 增量 |
 |---|---:|---:|
-| 同轮召回 | 33/33 | **33/33** |
-| 终轮召回（严格 / 并集） | 33/33 | **33/33** |
-| 跨工具召回（send_alert） | 14/14 | **14/14** |
-| 终轮召回 decode | ~72.6 tok/s | **106.0–135.8 tok/s** |
-| 探针 decode | ~30–40 tok/s | **58.7–98.5 tok/s** |
-| 131K decode（greedy，缝合窗口） | 71.4 tok/s | **120.3 tok/s** |
+| restore 页数 | 576 | **124–181** |
+| read | 69 ms | **14–21 ms** |
+| sync | 94 ms | **20–29 ms** |
+| 总耗时 | 163 ms | **33–51 ms** |
 
-召回质量零损失，decode 最高提升 ~87%。测试驱动为仓库根目录
-[`niah33_262k.py`](niah33_262k.py)，结果写入 `niah33-262k-metrics.json`。
+256K 时 `changed` 中位数 495/576，自动回退全量，行为与之前一致。
 
-## 2026-10-19 更新：召回传输优化（2 倍）
+### 256K 召回（NIAH 33 针）
 
-### 问题
+| 指标 | 结果 |
+|---|---:|
+| 同轮 / 终轮严格 / 并集 | 33/33 |
+| 跨工具（send_alert） | 14/14 |
+| 工具调用 | 80 |
+| 端到端（到 final sweep） | 595.8 s |
 
-KVMem 每次窗口重选要搬约 2.2 GB（spill 832 页 + restore 576 页），实测只有 3.8–4.5 GB/s，
-而同一张卡的链路能跑 14.1 GB/s（独立探针实测，见文档 §8）。
+### LongMemEval 上下文扫描
 
-### 根因
+同一组实例（idx 0,1,2）、20 题、`What exactly did the user say` probe，对比 ActKV 与 EMA：
 
-`record_groups` 的语义是「每条记录所在的分配区」，用于阻止跨 `cudaMalloc` 区域拼一次
-strided 拷贝。`kvmem_window.cpp` 的 spill/restore 却传了块 id（sink / recent / topk 混排，
-天然不连续），合并条件 `groups[next] == groups[next-1]` 恒不成立——576 页被拆成
-36,864 次单页 26 KiB 拷贝，耗时全耗在驱动提交上，GPU 拷贝引擎几乎空闲（`sync_us` 仅 5 ms）。
+| 上下文 | ActKV | EMA |
+|---|---:|---:|
+| 128K | **20/20** | 19/20 |
+| 192K | **18/20** | 16/20 |
+| 240K | **16/20** | 15/20 |
+| 合计 | **54/60** | 50/60 |
 
-设备页其实是连续的（`runs=1`），宿主记录也来自同一块 pinned staging（步长恒为
-1,671,168），本就该合并。
+- **最佳工作区间：128K–192K**；
+- 192K 开始掉分（ActKV 100% → 90%），240K 明显劣化（80%）；
+- 240K 的 4 道失败里 3 道是模型拒答，不是 KV 淘汰。
 
-### 修复
+### 旧更新日志
 
-`kvmem_window.cpp` 4 处调用点把第三个实参从 `spill_ids` / `selected` 改为空 groups：
-`start_spill` 的 text / MTP，`start_restore` 的 text / MTP。空 groups 与 `verify` 分支
-原有写法一致，合并仍受「设备页连续 + 宿主步长恒定 + 步长上限」三重约束。
-
-### 实测
-
-| 指标 | 修复前 | 修复后 | 提升 |
-|---|---:|---:|---:|
-| DMA 带宽 | 4.0 GB/s | **14.1 GB/s** | **3.5×** |
-| 单次重选（64K 首次） | 1,002 ms | **584 ms** | 1.72× |
-| 单次重选（64K 稳态） | 857 ms | **463 ms** | 1.85× |
-| 单次重选（256K 均值，24 次） | 515 ms | **256 ms** | **2.02×** |
-| 256K 传输合计 | 12.37 s | **6.14 s** | −50.4% |
-| 256K prefill | 340.8 tok/s | **343.4 tok/s** | +0.78% |
-| 256K 端到端 | 729.8 s | **724.2 s** | −0.77% |
-
-256K 的 24 次重选中，22 次稳态均为 1.99–2.20×；两次冷启动（spill 832 页）为 1.63×/1.76×，
-因为另有约 300 ms 的 plan/evict/epoch 开销未动。
-
-### 正确性
-
-输出逐位不变：64K 接受率 124/296，256K 112/343（新旧一致）；
-`--kvmem-verify-transfers` 回放两次重选均 `payload_exact=1 state_exact=1`；
-纯计算吞吐 346.7 → 346.4 tok/s（−0.08%，噪声内）。
-
-### 同日其他改动
-
-- 新增诊断开关 `KVMEM_PLANE_TIMING`（逐 plane 打印）、`KVMEM_GEOM`（几何）、`KVMEM_RESELECT`。
-- `start_spill` 清零从整窗 memset 改为只清 partial 页，省约 66 ms/次。
-- 完整带宽基准、逐次对比与剩余优化空间见
-  [docs/kvmem-recall-opt-20261019.md](docs/kvmem-recall-opt-20261019.md)。
-
-> 子模块 `backends/ninfer` 的上游是第三方仓库（`iamwavecut/ninfer-all.git`），本次改动
-> 没有推送权限。完整改动已作为
-> [`docs/patches/0001-feat-qwen3_5-DFlash2-KVMem-window-recall-with-merged.patch`](docs/patches/0001-feat-qwen3_5-DFlash2-KVMem-window-recall-with-merged.patch)
-> 附带（183 个文件）；在 `backends/ninfer` 里 `git am <该文件>` 即可复现。
+- 2026-10-18 DFlash2 × KVMem 修复：[docs/dflash2-kvmem-fixes-20261018.md](docs/dflash2-kvmem-fixes-20261018.md)
+- 2026-10-19 召回传输优化（DMA 4.0 → 14.1 GB/s）：[docs/kvmem-recall-opt-20261019.md](docs/kvmem-recall-opt-20261019.md)
+- 2026-10-19 重选水位提前到 80%：[docs/kvmem-reselect-high-water-20261019.md](docs/kvmem-reselect-high-water-20261019.md)
 
 ## GGUF → .ninfer 模型转换
 
@@ -140,4 +169,6 @@ python3 -m tools.convert \
 - [后端能力与启动说明](docs/multi-backend.md)
 - [仓库结构与构建](docs/multi-backend-repository.md)
 - [后端差异](docs/multi-backend-differences.md)
+- [sm70/sm75 移植与块大小结论（2026-10-22）](docs/kvmem-sm75-sm70-port-20261022.md)
+- [子模块 patch 恢复说明](docs/patches/README.md)
 

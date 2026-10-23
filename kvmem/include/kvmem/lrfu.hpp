@@ -69,9 +69,17 @@ public:
             std::nth_element(ranked.begin(), ranked.begin() + rank, ranked.end());
             threshold = ranked[rank];
         }
-        for (size_t i = 0; i < scores.size(); ++i)
-            (*next)[i] = lambda_ * (i < state_.scores->size() ? (*state_.scores)[i] : 0) +
-                (scores[i] >= threshold ? scores[i] : 0);
+        // ActKV (arXiv 2609.31395) Algorithm 1: keep score is a decayed sum of
+        // action-region attention, not an average. A hit adds the raw score, a
+        // miss only decays, so an intermittent entry that scores high every few
+        // rounds survives temporary inactivity while a stale continuous entry
+        // still fades. A block seen for the first time starts from zero and is
+        // seeded by its first hit, matching Init(L_ora, 0).
+        for (size_t i = 0; i < scores.size(); ++i) {
+            const bool hit = scores[i] >= threshold;
+            const double previous = i < state_.scores->size() ? (*state_.scores)[i] : 0.0;
+            (*next)[i] = lambda_ * previous + (hit ? scores[i] : 0.0);
+        }
         candidate_ = std::move(next);
     }
     bool commit() noexcept {
